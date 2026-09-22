@@ -66,7 +66,7 @@ class YuiLockClient:
 
     async def _send_bt(self, payload: dict, timeout: float) -> dict:
         try:
-            import winrt.windows.devices.bluetooth as wbt  # noqa: F401
+            import winrt.windows.devices.bluetooth as wbt
             import winrt.windows.devices.bluetooth.rfcomm as wrf
             import winrt.windows.devices.enumeration as wen
             import winrt.windows.networking.sockets as wns
