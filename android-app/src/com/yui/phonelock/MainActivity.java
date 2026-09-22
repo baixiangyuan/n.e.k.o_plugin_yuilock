@@ -1,0 +1,203 @@
+package com.yui.phonelock;
+
+import android.app.Activity;
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.provider.Settings;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Enumeration;
+
+public class MainActivity extends Activity {
+
+    private static final int PERMS_REQ = 10;
+    private static final int ADMIN_REQ = 11;
+
+    private SharedPreferences prefs;
+    private final Handler ui = new Handler();
+    private DevicePolicyManager dpm;
+    private ComponentName adminComp;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        prefs = getSharedPreferences("yuilock", MODE_PRIVATE);
+        dpm = (DevicePolicyManager) getSystemService(DEVICE_POLICY_SERVICE);
+        adminComp = new ComponentName(this, AdminReceiver.class);
+
+        String token = prefs.getString("token", null);
+        if (token == null || token.isEmpty()) {
+            token = randomToken();
+            prefs.edit().putString("token", token).apply();
+        }
+        ((EditText) findViewById(R.id.etPort)).setText(prefs.getString("port", "48912"));
+        ((EditText) findViewById(R.id.etToken)).setText(token);
+        ((TextView) findViewById(R.id.tvHelp)).setText(getString(R.string.help_text));
+
+        findViewById(R.id.btnSave).setOnClickListener(v -> save());
+        findViewById(R.id.btnAdmin).setOnClickListener(v -> askAdmin());
+        findViewById(R.id.btnUsage).setOnClickListener(v ->
+                startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)));
+        findViewById(R.id.btnStart).setOnClickListener(v -> {
+            Intent i = new Intent(this, LockService.class);
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(i);
+            } else {
+                startService(i);
+            }
+        });
+        findViewById(R.id.btnStop).setOnClickListener(v ->
+                stopService(new Intent(this, LockService.class)));
+        findViewById(R.id.btnTest).setOnClickListener(v -> {
+            if (dpm.isAdminActive(adminComp)) {
+                dpm.lockNow();
+            } else {
+                Toast.makeText(this, "请先激活锁屏权限（第①步）", Toast.LENGTH_SHORT).show();
+            }
+        });
+        findViewById(R.id.btnBattery).setOnClickListener(v -> batteryWhiteList());
+
+        requestPerms();
+        poll();
+    }
+
+    private void requestPerms() {
+        ArrayList<String> need = new ArrayList<>();
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            need.add("android.permission.POST_NOTIFICATIONS");
+        }
+        if (Build.VERSION.SDK_INT >= 31
+                && checkSelfPermission("android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED) {
+            need.add("android.permission.BLUETOOTH_CONNECT");
+        }
+        if (!need.isEmpty()) {
+            requestPermissions(need.toArray(new String[0]), PERMS_REQ);
+        }
+    }
+
+    private String randomToken() {
+        SecureRandom r = new SecureRandom();
+        StringBuilder sb = new StringBuilder();
+        String chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+        for (int i = 0; i < 12; i++) {
+            sb.append(chars.charAt(r.nextInt(chars.length())));
+        }
+        return sb.toString();
+    }
+
+    private void save() {
+        String p = ((EditText) findViewById(R.id.etPort)).getText().toString().trim();
+        int port;
+        try {
+            port = Integer.parseInt(p);
+        } catch (Exception e) {
+            port = 0;
+        }
+        if (port < 1024 || port > 65535) {
+            Toast.makeText(this, "端口需在 1024-65535 之间", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String token = ((EditText) findViewById(R.id.etToken)).getText().toString().trim();
+        prefs.edit().putString("port", p).putString("token", token).apply();
+        Toast.makeText(this, "已保存（服务运行中则停止后再启动生效）", Toast.LENGTH_LONG).show();
+    }
+
+    private void askAdmin() {
+        if (dpm.isAdminActive(adminComp)) {
+            Toast.makeText(this, "锁屏权限已激活", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            Intent i = new Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN);
+            i.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, adminComp);
+            i.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, getString(R.string.admin_desc));
+            startActivityForResult(i, ADMIN_REQ);
+        } catch (Exception e) {
+            Toast.makeText(this, "无法打开设备管理器设置", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void batteryWhiteList() {
+        try {
+            startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private void poll() {
+        final TextView tvStatus = findViewById(R.id.tvStatus);
+        final Button btnAdmin = findViewById(R.id.btnAdmin);
+        Runnable r = new Runnable() {
+            @Override
+            public void run() {
+                boolean adminOk = dpm.isAdminActive(adminComp);
+                boolean applock = prefs.getBoolean("applock_active", false);
+                StringBuilder sb = new StringBuilder();
+                sb.append("服务: ").append(LockService.running ? "运行中" : "未启动").append('\n');
+                sb.append("端口: ").append(LockService.activePort).append('\n');
+                sb.append("本机 IP: ").append(lanIps()).append('\n');
+                sb.append("蓝牙监听: ").append(LockService.btListening ? "开" : "关").append('\n');
+                sb.append("锁屏权限: ").append(adminOk ? "已激活" : "未激活").append('\n');
+                sb.append("应用锁: ").append(applock ? "开启中（打开任何 App 会被弹回桌面，重启也不解除）" : "关闭").append('\n');
+                sb.append("最近事件: ").append(LockService.lastEvent);
+                tvStatus.setText(sb.toString());
+                btnAdmin.setText(adminOk ? "① 锁屏权限已激活 ✓" : getString(R.string.btn_admin));
+                ui.postDelayed(this, 1000);
+            }
+        };
+        ui.post(r);
+    }
+
+    static String lanIps() {
+        StringBuilder sb = new StringBuilder();
+        try {
+            Enumeration<NetworkInterface> nis = NetworkInterface.getNetworkInterfaces();
+            while (nis.hasMoreElements()) {
+                NetworkInterface ni = nis.nextElement();
+                if (!ni.isUp() || ni.isLoopback()) continue;
+                Enumeration<InetAddress> addrs = ni.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    InetAddress a = addrs.nextElement();
+                    if (a instanceof Inet4Address && !a.isLoopbackAddress()) {
+                        if (sb.length() > 0) sb.append("  ");
+                        sb.append(a.getHostAddress());
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return sb.length() == 0 ? "（未连接 Wi-Fi）" : sb.toString();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+}
