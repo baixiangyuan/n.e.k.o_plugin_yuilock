@@ -1,4 +1,4 @@
-﻿{
+{
   "python.defaultInterpreterPath": "python",
   "python.linting.enabled": true,
   "python.linting.mypyEnabled": true,
@@ -9,4 +9,3 @@
     "**/*.pyc": true
   }
 }
-
