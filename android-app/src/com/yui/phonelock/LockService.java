@@ -22,6 +22,7 @@ import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.provider.Settings;
 
 import org.json.JSONObject;
 
@@ -67,6 +68,7 @@ public class LockService extends Service implements CommandHandler.Host {
     private static final int MAX_CONNECTIONS = 4;
     private static final int POOL_QUEUE_CAPACITY = 8;
     private static final int MAX_COMMANDS_PER_CONNECTION = 30;
+    private static final long SESSION_MAX_MS = 60_000;
     public static final String SPP_UUID_STR = "00001101-0000-1000-8000-00805F9B34FB";
 
     public static volatile boolean running = false;
@@ -255,6 +257,11 @@ public class LockService extends Service implements CommandHandler.Host {
                     }
                     if (!nonce.isEmpty()) {
                         reply.put("n", nonce);
+                        // 已配对时对发现应答签名（绑定本次随机数），客户端只采信带合法签名的包
+                        String tokenNow = prefs.getString("token", "");
+                        if (!tokenNow.isEmpty()) {
+                            reply.put("sig", CommandHandler.hmacSha256Hex(tokenNow, "discover|" + nonce));
+                        }
                     }
                     reply.put("device", android.os.Build.MODEL);
                     reply.put("port", port());
@@ -363,9 +370,14 @@ public class LockService extends Service implements CommandHandler.Host {
 
     private void serve(InputStream in, OutputStream out, Socket tcpSocket) {
         CommandHandler.Session session = new CommandHandler.Session();
+        long deadline = System.currentTimeMillis() + SESSION_MAX_MS;
         try {
             int count = 0;
             while (running) {
+                // 单连接总时长上限：空行刷屏也无法长期占住名额（空行同样计入命令上限）
+                if (System.currentTimeMillis() > deadline) {
+                    return;
+                }
                 String line;
                 try {
                     line = readLineBounded(in);
@@ -379,12 +391,12 @@ public class LockService extends Service implements CommandHandler.Host {
                 if (line == null) {
                     return;
                 }
+                if (++count > MAX_COMMANDS_PER_CONNECTION) {
+                    return;
+                }
                 line = line.trim();
                 if (line.isEmpty()) {
                     continue;
-                }
-                if (++count > MAX_COMMANDS_PER_CONNECTION) {
-                    return; // 命令速率上限，防止长时间占用名额
                 }
                 String resp = CommandHandler.handle(line, this, session);
                 out.write(resp.getBytes(StandardCharsets.UTF_8));
@@ -456,24 +468,25 @@ public class LockService extends Service implements CommandHandler.Host {
             appLockRunning = true;
             UsageStatsManager usm = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
             try {
+                if (!Settings.canDrawOverlays(this)) {
+                    lastEvent = "应用锁：建议授予「显示悬浮窗」权限（Android 10+ 后台拉起桌面需要）";
+                }
                 while (running && prefs.getBoolean("applock_active", false)) {
                     try {
-                        long now = System.currentTimeMillis();
-                        UsageEvents ev = usm.queryEvents(now - 3000, now);
-                        UsageEvents.Event e = new UsageEvents.Event();
-                        String top = null;
-                        while (ev.hasNextEvent()) {
-                            ev.getNextEvent(e);
-                            if (e.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND) {
-                                top = e.getPackageName();
-                            }
-                        }
+                        String top = queryTop(usm);
                         if (top != null && !whitelist.contains(top)) {
                             Intent home = new Intent(Intent.ACTION_MAIN)
                                     .addCategory(Intent.CATEGORY_HOME)
                                     .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                             startActivity(home);
-                            lastEvent = "应用锁拦截: " + top;
+                            Thread.sleep(400);
+                            // 后台拉起可能被系统静默拒绝（Android 10+）：核验是否真的回到桌面
+                            String nowTop = queryTop(usm);
+                            if (top.equals(nowTop)) {
+                                lastEvent = "应用锁拦截失败：请在系统设置授予本应用「显示悬浮窗」权限";
+                            } else {
+                                lastEvent = "应用锁拦截: " + top;
+                            }
                         }
                         Thread.sleep(300);
                     } catch (InterruptedException ie) {
@@ -491,6 +504,24 @@ public class LockService extends Service implements CommandHandler.Host {
             }
         }, "yuilock-applock");
         appLockThread.start();
+    }
+
+    private String queryTop(UsageStatsManager usm) {
+        try {
+            long now = System.currentTimeMillis();
+            UsageEvents ev = usm.queryEvents(now - 3000, now);
+            UsageEvents.Event e = new UsageEvents.Event();
+            String top = null;
+            while (ev.hasNextEvent()) {
+                ev.getNextEvent(e);
+                if (e.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND) {
+                    top = e.getPackageName();
+                }
+            }
+            return top;
+        } catch (Exception e2) {
+            return null;
+        }
     }
 
     private synchronized void stopAppLock() {

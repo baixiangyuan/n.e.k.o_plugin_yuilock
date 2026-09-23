@@ -236,7 +236,8 @@ class YuiLockPlugin(NekoPluginBase):
         try:
             p = await self.client.ping()
             pc = self._pc_lock_alive()
-            if isinstance(p, dict) and p.get("ok"):
+            online = isinstance(p, dict) and bool(p.get("ok"))
+            if online:
                 token_note = "" if p.get("token_set") else "（⚠ 手机未设令牌，控制命令被拒绝）"
                 s = (f"手机：在线（{p.get('device', '?')}，电量 {p.get('battery', '?')}%，"
                      f"锁屏权限{'有' if p.get('admin') else '未激活'}，"
@@ -244,7 +245,8 @@ class YuiLockPlugin(NekoPluginBase):
                      f"电脑锁：{'开' if pc else '关'}")
             else:
                 s = f"手机：不在线（{(p or {}).get('error', '无响应')}）；电脑锁：{'开' if pc else '关'}"
-            return Ok({"summary": s})
+            # phone_online 单独成字段：面板只根据它上色，RPC 成功 ≠ 手机在线
+            return Ok({"summary": s, "phone_online": online})
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 

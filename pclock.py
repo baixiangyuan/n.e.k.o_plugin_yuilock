@@ -108,7 +108,7 @@ def spawn_locker(script: Path, allow_exes: list[str] | None = None) -> dict:
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     STATE_PATH.write_text(json.dumps(
-        {"pid": proc.pid, "instance": instance, "exe": exe}), encoding="utf-8")
+        {"pid": proc.pid, "instance": instance, "exe": exe.lower()}), encoding="utf-8")
     return {"ok": True, "pid": proc.pid, "instance": instance}
 
 

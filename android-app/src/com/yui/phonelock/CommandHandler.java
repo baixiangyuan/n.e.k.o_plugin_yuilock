@@ -110,22 +110,31 @@ public final class CommandHandler {
             if (!constantTimeEquals(want, proof)) {
                 return fail("令牌验证失败");
             }
+            // 执行；成功的最终响应带 HMAC 签名（覆盖 challenge/命令/nonce/结果），
+            // 客户端核对通过才采信，防中间人篡改结果伪造成功。
+            JSONObject resp;
             switch (cmd) {
                 case "lock":
                     if (!h.isAdminActive()) {
                         return fail("手机未激活设备管理器，请先在 Yui Lock 应用里完成第①步");
                     }
                     h.lockScreen();
-                    return ok("lock");
+                    resp = okJson("lock");
+                    break;
                 case "applock":
-                    return h.setAppLock(true) ? ok("applock")
-                            : fail("开启失败：请先在应用里授予“使用情况访问权限”");
+                    resp = h.setAppLock(true) ? okJson("applock")
+                            : failJson("开启失败：请先在应用里授予“使用情况访问权限”");
+                    break;
                 case "unlock":
                     h.setAppLock(false);
-                    return ok("unlock");
+                    resp = okJson("unlock");
+                    break;
                 default:
                     return fail("未知命令");
             }
+            resp.put("sig", hmacSha256Hex(expect, responseSigMessage(
+                    cmd, nonce, challenge, resp.optBoolean("ok"), resp.optString("error", ""))));
+            return resp.toString();
         } catch (Exception e) {
             return fail("请求格式错误");
         }
@@ -172,15 +181,30 @@ public final class CommandHandler {
                 b.toLowerCase().getBytes(StandardCharsets.UTF_8));
     }
 
-    private static String ok(String action) {
+    static String responseSigMessage(String cmd, String nonce, String challenge,
+                                     boolean ok, String error) {
+        return "resp|" + cmd + "|" + nonce + "|" + challenge + "|"
+                + (ok ? "1" : "0") + "|" + (error == null ? "" : error);
+    }
+
+    private static JSONObject okJson(String action) {
+        JSONObject o = new JSONObject();
         try {
-            JSONObject o = new JSONObject();
             o.put("ok", true);
             o.put("action", action);
-            return o.toString();
-        } catch (Exception e) {
-            return "{\"ok\":true}";
+        } catch (Exception ignored) {
         }
+        return o;
+    }
+
+    private static JSONObject failJson(String msg) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("ok", false);
+            o.put("error", msg);
+        } catch (Exception ignored) {
+        }
+        return o;
     }
 
     private static String fail(String msg) {

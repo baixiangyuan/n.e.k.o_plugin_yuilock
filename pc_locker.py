@@ -63,8 +63,8 @@ OPTS = ARGS.parse_args()
 
 SELF_PATH = os.path.abspath(sys.executable).lower()
 ALLOW_PATHS = {os.path.abspath(p).lower() for p in OPTS.allow}
-# N.E.K.O. 组件大多与 --allow 传入的可执行文件同安装目录（Electron/后端同目录树）
-TRUSTED_DIRS = {os.path.dirname(p) for p in ALLOW_PATHS}
+# 系统外壳只认系统目录下的完整路径（防止把同名 exe 放别处绕过）
+SYSTEM_ROOT = os.path.join(os.environ.get("SystemRoot", r"C:\Windows").lower(), "")
 
 
 def exe_path(pid: int) -> str:
@@ -88,22 +88,23 @@ def allowed_pid(pid: int) -> bool:
     # 查不到路径（权限不足等）一律拒绝放行，宁可错关不可放过未知进程
     if not path:
         return False
-    # 用「去掉扩展名的主名」规范化，与白名单同一标准：explorer.exe -> explorer
-    name = norm_name(os.path.splitext(os.path.basename(path))[0])
-    if name in WHITELIST_BASE:
-        return True
     lp = path.lower()
-    if lp == SELF_PATH or lp in ALLOW_PATHS:
+    # 系统外壳：主名匹配 + 必须位于 %SystemRoot% 下（完整路径，防改名/挪位置绕过）
+    name = norm_name(os.path.splitext(os.path.basename(path))[0])
+    if name in WHITELIST_BASE and lp.startswith(SYSTEM_ROOT):
         return True
-    if os.path.dirname(lp) in TRUSTED_DIRS:
+    # 显式 exe 路径列表（不信任整个目录）
+    if lp == SELF_PATH or lp in ALLOW_PATHS:
         return True
     return False
 
 
 def write_state() -> None:
+    # 必须带 exe：与 pclock.spawn_locker 写入的内容一致，绝不能覆盖掉三重校验数据
     try:
         with open(OPTS.state, "w", encoding="utf-8") as f:
-            json.dump({"pid": os.getpid(), "instance": OPTS.instance}, f)
+            json.dump({"pid": os.getpid(), "instance": OPTS.instance,
+                       "exe": os.path.abspath(sys.executable).lower()}, f)
     except Exception:
         pass
 

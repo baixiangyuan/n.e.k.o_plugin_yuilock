@@ -51,10 +51,20 @@ class YuiLockClient:
             def datagram_received(self, data: bytes, addr):
                 try:
                     m = json.loads(data.decode("utf-8"))
-                    if m.get("yui_lock_service") and m.get("n") == nonce:
-                        found.put_nowait(addr[0])
+                    if not (m.get("yui_lock_service") and m.get("n") == nonce):
+                        return
+                    # 已配对（有 token）时，发现应答必须带 HMAC 防伪造
+                    if self_token:
+                        want = hmac.new(self_token.encode("utf-8"),
+                                        ("discover|" + nonce).encode("utf-8"),
+                                        hashlib.sha256).hexdigest()
+                        if not hmac.compare_digest(want, str(m.get("sig", "")).lower()):
+                            return
+                    found.put_nowait(addr[0])
                 except Exception:
                     pass
+
+        self_token = self.token
 
         transport, _ = await loop.create_datagram_endpoint(
             P, remote_addr=("255.255.255.255", self.port), allow_broadcast=True)
@@ -88,7 +98,11 @@ class YuiLockClient:
                 line2 = await asyncio.wait_for(reader.readline(), timeout)
                 if not line2:
                     raise RuntimeError("手机无响应")
-                return json.loads(line2.decode("utf-8"))
+                r2 = json.loads(line2.decode("utf-8"))
+                if r2.get("ok") and not self._verify_resp(r2, payload, str(r1["challenge"])):
+                    return {"ok": False,
+                            "error": "响应签名校验失败，结果不可信（可能遭篡改）"}
+                return r2
             return r1
         finally:
             writer.close()
@@ -151,10 +165,26 @@ class YuiLockClient:
             if r1.get("auth") == "hmac-sha256" and r1.get("challenge"):
                 proof = _auth_proof(self.token, str(payload.get("cmd")),
                                     str(payload.get("nonce")), str(r1["challenge"]))
-                return await send_recv(dict(payload, proof=proof))
+                r2 = await send_recv(dict(payload, proof=proof))
+                if r2.get("ok") and not self._verify_resp(r2, payload, str(r1["challenge"])):
+                    return {"ok": False,
+                            "error": "响应签名校验失败，结果不可信（可能遭篡改）"}
+                return r2
             return r1
         finally:
             sock.close()
+
+    def _verify_resp(self, r2: dict, payload: dict, challenge: str) -> bool:
+        """核对手机对最终结果的 HMAC（覆盖 challenge/命令/nonce/结果）。"""
+        sig = str(r2.get("sig", ""))
+        if not sig:
+            return False
+        msg = "resp|{}|{}|{}|{}|{}".format(
+            payload.get("cmd"), payload.get("nonce"), challenge,
+            "1" if r2.get("ok") else "0", str(r2.get("error", "")))
+        want = hmac.new(self.token.encode("utf-8"), msg.encode("utf-8"),
+                        hashlib.sha256).hexdigest()
+        return hmac.compare_digest(want, sig.lower())
 
     # ---------------- 对外 ----------------
 

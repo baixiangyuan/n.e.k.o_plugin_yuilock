@@ -67,7 +67,8 @@ export default function YuiLockPanel(props: PluginSurfaceProps) {
       const data = unwrapActionResult(envelope)
       setStatus({
         loading: false,
-        online: true,
+        // RPC 成功 ≠ 手机在线：只用接口明确给出的 phone_online 上色
+        online: data.phone_online === true,
         summary: String(data.summary || ""),
         error: "",
       })

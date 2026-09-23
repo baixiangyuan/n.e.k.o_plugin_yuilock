@@ -64,6 +64,13 @@ class TestPluginStructure(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 ast.parse(f.read(), path)
 
+    def test_locker_state_keeps_exe(self):
+        """回归 #17：pc_locker 自己写状态时必须带 exe，
+        否则会覆盖 pclock 的 {pid, instance, exe}，导致解锁三重校验永远失败。"""
+        with open(os.path.join(ROOT, "pc_locker.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('"exe"', src, "pc_locker.write_state 必须写入 exe 字段")
+
 
 def auth(token: str, cmd: str, nonce: str, challenge: str) -> str:
     msg = f"{cmd}|{nonce}|{challenge}".encode("utf-8")
@@ -76,7 +83,8 @@ class TestClientProtocol(unittest.TestCase):
     未认证直接 ok=true 的对端会被客户端拒绝。"""
 
     @staticmethod
-    async def _phone(reader, writer, token: str, immediate_ok: bool = False):
+    async def _phone(reader, writer, token: str, immediate_ok: bool = False,
+                     unsigned_final: bool = False):
         # 挑战按连接隔离：状态在 handle 连接内部
         session = {"challenge": "", "cmd": "", "nonce": ""}
         try:
@@ -103,9 +111,17 @@ class TestClientProtocol(unittest.TestCase):
                                  and session["nonce"] == str(req.get("nonce", "")))
                         want = auth(token, cmd, str(req.get("nonce", "")),
                                     session["challenge"]) if valid else ""
+                        ch = session["challenge"]
+                        nonce = str(req.get("nonce", ""))
                         session["challenge"] = ""
                         if valid and hmac.compare_digest(want, str(req.get("proof")).lower()):
                             resp = {"ok": True, "action": cmd}
+                            # 成功响应带签名（resp|cmd|nonce|challenge|1|error），客户端核验后才采信
+                            if not unsigned_final:
+                                resp["sig"] = hmac.new(
+                                    token.encode(),
+                                    f"resp|{cmd}|{nonce}|{ch}|1|".encode(),
+                                    hashlib.sha256).hexdigest()
                         else:
                             resp = {"ok": False, "error": "令牌验证失败"}
                 else:
@@ -215,6 +231,24 @@ class TestClientProtocol(unittest.TestCase):
                 r = await c.lock_screen()
                 self.assertFalse(r.get("ok"), r)
                 self.assertIn("认证流程异常", r.get("error", ""))
+
+        asyncio.run(scenario())
+
+    def test_unsigned_final_ok_rejected(self):
+        """最终成功响应缺 HMAC 签名（被篡改/伪造），客户端必须拒绝采信。"""
+        client_mod = load_module("yuilock_client_test5", os.path.join(ROOT, "client.py"))
+
+        async def scenario():
+            server = await asyncio.start_server(
+                lambda r, w: self._phone(r, w, "TESTTOKEN", unsigned_final=True),
+                "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                c = client_mod.YuiLockClient(
+                    host="127.0.0.1", port=port, token="TESTTOKEN", transport="lan")
+                r = await c.lock_screen()
+                self.assertFalse(r.get("ok"), r)
+                self.assertIn("响应签名校验失败", r.get("error", ""))
 
         asyncio.run(scenario())
 

@@ -56,6 +56,14 @@ public class MainActivity extends Activity {
         findViewById(R.id.btnAdmin).setOnClickListener(v -> askAdmin());
         findViewById(R.id.btnUsage).setOnClickListener(v ->
                 startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)));
+        findViewById(R.id.btnOverlay).setOnClickListener(v -> {
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (Exception e) {
+                startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION));
+            }
+        });
         findViewById(R.id.btnScan).setOnClickListener(v -> startScan());
         findViewById(R.id.btnStart).setOnClickListener(v -> {
             Intent i = new Intent(this, LockService.class);
@@ -243,6 +251,9 @@ public class MainActivity extends Activity {
                 String applockText;
                 if (intercepting) {
                     applockText = "拦截中（打开任何 App 会被弹回桌面，重启手机即解除）";
+                    if (!Settings.canDrawOverlays(MainActivity.this)) {
+                        applockText += "\n⚠ 未授予「显示悬浮窗」：Android 10+ 可能拦不住，建议点下方按钮授权";
+                    }
                 } else if (marked) {
                     applockText = "已标记但拦截未运行（服务重启后会自动恢复，权限不足则自动关闭）";
                 } else {

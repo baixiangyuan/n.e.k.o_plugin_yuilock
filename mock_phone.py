@@ -46,9 +46,15 @@ async def handle(reader, writer):
                              and session["nonce"] == str(req.get("nonce", "")))
                     want = auth(TOKEN, cmd, str(req.get("nonce", "")),
                                 session["challenge"]) if valid else ""
+                    ch = session["challenge"]
+                    nonce = str(req.get("nonce", ""))
                     session["challenge"] = ""
                     if valid and hmac.compare_digest(want, str(req.get("proof")).lower()):
                         resp = {"ok": True, "action": cmd}
+                        # 成功的最终响应带签名（resp|cmd|nonce|challenge|ok|error），客户端核验后才采信
+                        resp["sig"] = hmac.new(
+                            TOKEN.encode(), f"resp|{cmd}|{nonce}|{ch}|1|".encode(),
+                            hashlib.sha256).hexdigest()
                     else:
                         resp = {"ok": False, "error": "令牌验证失败"}
             else:

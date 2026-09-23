@@ -17,6 +17,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 应用锁：检测前台应用（需用户在设置里授予使用情况访问权限） -->
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+    <!-- 应用锁：Android 10+ 后台拉起桌面需要「显示悬浮窗」权限豁免 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- 电池优化白名单请求 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 蓝牙 RFCOMM(SPP)：Android 12+ 需要运行时授权 -->

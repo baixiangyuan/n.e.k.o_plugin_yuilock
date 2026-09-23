@@ -8,6 +8,7 @@
     <string name="btn_save">保存设置</string>
     <string name="btn_admin">① 激活锁屏权限（设备管理器）</string>
     <string name="btn_usage">② 授予使用情况访问权限（应用锁需要）</string>
+    <string name="btn_overlay">授予「显示悬浮窗」权限（Android 10+ 应用锁建议）</string>
     <string name="btn_scan">③ 扫码配对（扫电脑上的二维码，自动填令牌）</string>
     <string name="btn_start">④ 启动监听服务</string>
     <string name="btn_stop">停止监听服务</string>
