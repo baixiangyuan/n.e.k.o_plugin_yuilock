@@ -1,6 +1,8 @@
 # Yui 手机/电脑锁（N.E.K.O. Plugin）
 
-apk下载地址：http://8.152.0.186:40033/s/vXfj（SHA256 与证书指纹见下方「安装」章节，安装前务必核对；正式渠道优先 GitHub Releases）
+apk下载地址：http://8.152.0.186:40033/s/vXfj
+
+（SHA256 与证书指纹见下方「安装」章节，安装前务必核对；正式渠道优先 GitHub Releases）
 
 让 Yui 可以惩罚主人：
 
