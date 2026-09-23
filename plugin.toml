@@ -4,7 +4,7 @@ name = "Yui 手机/电脑锁"
 description = "让 Yui 可以惩罚主人：锁手机（熄屏/应用锁）或锁电脑（打开任何程序立即弹回桌面，N.E.K.O. 不受影响）。lock_phone / lock_pc 等工具由 Yui 自主决定何时调用；电脑可用秘密按键组合解锁（不提示），重启即解锁。"
 short_description = "Yui 生气时可以锁主人的手机和电脑"
 keywords = ["手机", "锁屏", "锁机", "应用锁", "锁电脑", "惩罚", "生气", "phone", "lock", "pc"]
-version = "1.2.0"
+version = "1.3.0"
 entry = "plugins.yuilock:YuiLockPlugin"
 
 [plugin.author]
@@ -17,6 +17,16 @@ supported = ">=0.1.0,<0.3.0"
 [plugin_runtime]
 enabled = true
 auto_start = true
+
+[plugin.ui]
+enabled = true
+
+[[plugin.ui.panel]]
+id = "main"
+title = "Yui 手机/电脑锁"
+entry = "ui/panel.tsx"
+context = "dashboard"
+permissions = ["state:read", "action:call"]
 
 # 手机端 Yui Lock App 的连接配置
 [yuilock]

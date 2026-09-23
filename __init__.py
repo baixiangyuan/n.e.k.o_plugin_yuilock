@@ -12,6 +12,9 @@
 """
 from __future__ import annotations
 
+import base64
+import io
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,7 @@ from plugin.sdk.plugin import (
     llm_tool,
     neko_plugin,
     plugin_entry,
+    ui,
 )
 
 from . import pclock
@@ -72,6 +76,54 @@ class YuiLockPlugin(NekoPluginBase):
 
     def _pc_lock_alive(self) -> bool:
         return pclock.is_locker_alive()
+
+    @staticmethod
+    def _lan_ip() -> str:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("223.5.5.5", 80))
+            return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+        finally:
+            s.close()
+
+    def _pair_info(self) -> dict:
+        """面板用配对信息：pair URI + 二维码 PNG（data URL，qrcode 库可选）。"""
+        host = str(self._cfg.get("host", "auto") or "auto")
+        if host in ("", "auto", "none"):
+            host = self._lan_ip()
+        port = int(self._cfg.get("port", 48912) or 48912)
+        token = str(self._cfg.get("token", "") or "")
+        uri = f"yuilock://pair?h={host}&p={port}&t={token}"
+        qr = None
+        try:
+            import qrcode
+
+            code = qrcode.QRCode(border=2)
+            code.add_data(uri)
+            code.make(fit=True)
+            buf = io.BytesIO()
+            code.make_image().save(buf, format="PNG")
+            qr = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            qr = None
+        return {
+            "pair_uri": uri,
+            "qr_data_url": qr,
+            "host": host,
+            "port": port,
+            "token_set": bool(token),
+            "pc_lock": pclock.is_locker_alive(),
+        }
+
+    @ui.context(id="dashboard", title="Yui Lock")
+    async def dashboard_context(self, **_):
+        """Hosted UI 面板的轻量上下文：配对二维码 + 电脑锁状态（不做网络请求）。"""
+        try:
+            return self._pair_info()
+        except Exception:
+            return {"pair_uri": "", "qr_data_url": None, "token_set": False, "pc_lock": False}
 
     async def _do_lock_phone(self, mode: str, reason: str) -> dict:
         if mode == "apps":
@@ -174,6 +226,7 @@ class YuiLockPlugin(NekoPluginBase):
 
     # ---------------- 手动测试入口（插件管理器里可直接触发） ----------------
 
+    @ui.action(id="yuilock_status", label="刷新状态", tone="info", group="状态")
     @plugin_entry(id="yuilock_status", name="锁机状态",
                   description="查询手机是否在线（电量/应用锁状态）和电脑锁状态。",
                   llm_result_fields=["summary"],
@@ -194,6 +247,8 @@ class YuiLockPlugin(NekoPluginBase):
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 
+    @ui.action(id="lock_phone_now", label="锁手机屏幕", tone="danger", group="手机",
+               confirm="确定要熄屏锁定手机吗？主人需要输密码才能解锁。")
     @plugin_entry(id="lock_phone_now", name="测试：锁手机屏幕",
                   description="手动触发熄屏锁屏（测试连通性用）。",
                   llm_result_fields=["summary"],
@@ -204,6 +259,8 @@ class YuiLockPlugin(NekoPluginBase):
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 
+    @ui.action(id="lock_phone_apps_now", label="手机应用锁", tone="danger", group="手机",
+               confirm="确定开启应用锁？锁定期间打开任何 App 都会被立刻弹回桌面。")
     @plugin_entry(id="lock_phone_apps_now", name="测试：手机应用锁",
                   description="手动开启手机应用锁（测试连通性用）。",
                   llm_result_fields=["summary"],
@@ -214,6 +271,7 @@ class YuiLockPlugin(NekoPluginBase):
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 
+    @ui.action(id="unlock_phone_now", label="解锁手机", tone="default", group="手机")
     @plugin_entry(id="unlock_phone_now", name="测试：解锁手机应用锁",
                   description="手动解除手机应用锁。",
                   llm_result_fields=["summary"],
@@ -224,6 +282,8 @@ class YuiLockPlugin(NekoPluginBase):
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 
+    @ui.action(id="lock_pc_now", label="锁电脑", tone="danger", group="电脑",
+               confirm="确定锁定这台电脑？锁定期间打开任何程序都会被立即弹回桌面。")
     @plugin_entry(id="lock_pc_now", name="测试：锁电脑",
                   description="手动锁定电脑（测试用）。",
                   llm_result_fields=["summary"],
@@ -231,6 +291,7 @@ class YuiLockPlugin(NekoPluginBase):
     async def lock_pc_now(self, **_):
         return Ok({"summary": self._do_lock_pc("")})
 
+    @ui.action(id="unlock_pc_now", label="解锁电脑", tone="default", group="电脑")
     @plugin_entry(id="unlock_pc_now", name="测试：解锁电脑",
                   description="手动解锁电脑（测试用）。",
                   llm_result_fields=["summary"],
