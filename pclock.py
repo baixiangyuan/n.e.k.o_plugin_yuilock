@@ -67,16 +67,34 @@ def is_locker_alive() -> bool:
     st = _read_state()
     if not st:
         return False
+    return _state_matches_process(st)
+
+
+def _state_matches_process(st: dict) -> bool:
+    """状态文件必须与真实进程三重对上：
+    1) 可执行文件路径 == 启动时记录的路径；
+    2) 命令行里有完整的「--instance <本次 uuid>」参数对；
+    3) pid 存活（以上查询本身即验证）。"""
     pid = st.get("pid")
     instance = str(st.get("instance", ""))
-    if not pid or not instance:
+    exe = str(st.get("exe", "")).strip().lower()
+    if not pid or not instance or not exe:
         return False
-    return instance in _win_process_cmdline(int(pid))
+    path = _win_process_path(int(pid)).lower()
+    if not path or path != exe:
+        return False
+    args = _win_process_cmdline(int(pid)).split()
+    for i, a in enumerate(args):
+        if a == "--instance" and i + 1 < len(args) and args[i + 1].strip() == instance:
+            return True
+    return False
 
 
 def spawn_locker(script: Path, allow_exes: list[str] | None = None) -> dict:
     if sys.platform != "win32":
         return {"ok": False, "error": "锁定电脑仅支持 Windows"}
+    if is_locker_alive():
+        return {"ok": False, "error": "已有锁机进程在运行，不要重复锁定"}
     instance = uuid.uuid4().hex
     python = Path(sys.executable)
     pythonw = python.with_name("pythonw.exe")
@@ -89,28 +107,30 @@ def spawn_locker(script: Path, allow_exes: list[str] | None = None) -> dict:
                                 cwd=str(script.parent))
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
-    STATE_PATH.write_text(json.dumps({"pid": proc.pid, "instance": instance}),
-                          encoding="utf-8")
+    STATE_PATH.write_text(json.dumps(
+        {"pid": proc.pid, "instance": instance, "exe": exe}), encoding="utf-8")
     return {"ok": True, "pid": proc.pid, "instance": instance}
 
 
 def kill_locker() -> tuple[bool, str]:
-    """结束锁机进程。返回 (是否确实结束过, 给用户看的消息)。"""
+    """结束锁机进程。返回 (是否确实结束过, 给用户看的消息)。
+    必须三重校验（路径/instance 参数对/pid 存活）全部通过才 taskkill，
+    状态文件被篡改或 PID 被复用时宁可不动手。"""
     st = _read_state()
     if not st:
         return False, "电脑当前没有锁定"
-    pid = st.get("pid")
-    instance = str(st.get("instance", ""))
-    killed = False
-    if pid and instance and instance in _win_process_cmdline(int(pid)):
-        if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/PID", str(int(pid))],
-                           capture_output=True, creationflags=CREATE_NO_WINDOW)
-        killed = True
+    if not _state_matches_process(st):
+        try:
+            STATE_PATH.unlink()
+        except Exception:
+            pass
+        return False, "锁机进程已不存在（可能崩溃或重启过），残留状态已清理"
+    pid = int(st["pid"])
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW)
     try:
         STATE_PATH.unlink()
     except Exception:
         pass
-    if killed:
-        return True, "电脑已解锁，恢复自由"
-    return False, "锁机进程已不存在（可能崩溃或重启过），残留状态已清理"
+    return True, "电脑已解锁，恢复自由"

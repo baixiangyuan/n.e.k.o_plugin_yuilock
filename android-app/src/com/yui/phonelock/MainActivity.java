@@ -78,6 +78,41 @@ public class MainActivity extends Activity {
 
         requestPerms();
         poll();
+        handleDeepLink(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleDeepLink(intent);
+    }
+
+    /** 系统相机扫配对码会以 VIEW 深链打开本应用；应用前请用户确认（Activity 已导出）。 */
+    private void handleDeepLink(Intent intent) {
+        try {
+            if (intent == null || intent.getData() == null) {
+                return;
+            }
+            android.net.Uri uri = intent.getData();
+            if (!"yuilock".equals(uri.getScheme()) || !"pair".equals(uri.getHost())) {
+                return;
+            }
+            final String text = uri.toString();
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("检测到配对码")
+                    .setMessage("是否把该配对码里的端口和令牌应用到本机？\n\n" + text)
+                    .setPositiveButton("应用", (d, w) -> {
+                        if (applyPair(text)) {
+                            Toast.makeText(this, "配对成功：端口和令牌已自动填好", Toast.LENGTH_LONG).show();
+                        } else {
+                            Toast.makeText(this, "配对码无效", Toast.LENGTH_SHORT).show();
+                        }
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+        } catch (Exception ignored) {
+        }
     }
 
     private void requestPerms() {
@@ -203,14 +238,23 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 boolean adminOk = dpm.isAdminActive(adminComp);
-                boolean applock = prefs.getBoolean("applock_active", false);
+                boolean intercepting = LockService.appLockRunning;
+                boolean marked = prefs.getBoolean("applock_active", false);
+                String applockText;
+                if (intercepting) {
+                    applockText = "拦截中（打开任何 App 会被弹回桌面，重启手机即解除）";
+                } else if (marked) {
+                    applockText = "已标记但拦截未运行（服务重启后会自动恢复，权限不足则自动关闭）";
+                } else {
+                    applockText = "关闭";
+                }
                 StringBuilder sb = new StringBuilder();
                 sb.append("服务: ").append(LockService.running ? "运行中" : "未启动").append('\n');
                 sb.append("端口: ").append(LockService.activePort).append('\n');
                 sb.append("本机 IP: ").append(lanIps()).append('\n');
                 sb.append("蓝牙监听: ").append(LockService.btListening ? "开" : "关").append('\n');
                 sb.append("锁屏权限: ").append(adminOk ? "已激活" : "未激活").append('\n');
-                sb.append("应用锁: ").append(applock ? "开启中（打开任何 App 会被弹回桌面，重启也不解除）" : "关闭").append('\n');
+                sb.append("应用锁: ").append(applockText).append('\n');
                 sb.append("最近事件: ").append(LockService.lastEvent);
                 tvStatus.setText(sb.toString());
                 btnAdmin.setText(adminOk ? "① 锁屏权限已激活 ✓" : getString(R.string.btn_admin));

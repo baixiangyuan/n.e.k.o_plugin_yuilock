@@ -1,7 +1,9 @@
 """
 Yui 手机/电脑锁 - 冒烟测试
 
-校验插件结构、plugin.toml 入口、手机客户端协议（含挑战-应答认证，不依赖 plugin.sdk）。
+校验插件结构、plugin.toml 入口、手机客户端协议（挑战-应答认证：
+proof 绑定 cmd|nonce|challenge、按连接隔离、拒绝未认证直接成功）。
+不依赖 plugin.sdk。
 """
 
 from __future__ import annotations
@@ -63,12 +65,20 @@ class TestPluginStructure(unittest.TestCase):
                 ast.parse(f.read(), path)
 
 
+def auth(token: str, cmd: str, nonce: str, challenge: str) -> str:
+    msg = f"{cmd}|{nonce}|{challenge}".encode("utf-8")
+    return hmac.new(token.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
 class TestClientProtocol(unittest.TestCase):
-    """对内置模拟手机验证：ping 免认证；控制命令走挑战-应答；错 token 被拒；
-    客户端未配 token 时拒绝发起控制。"""
+    """对内置模拟手机验证：ping 免认证；控制命令走挑战-应答且 proof 与
+    cmd/nonce/challenge 绑定；错 token 被拒；客户端未配 token 时拒绝发起控制；
+    未认证直接 ok=true 的对端会被客户端拒绝。"""
 
     @staticmethod
-    async def _phone(reader, writer, token: str, shared: dict):
+    async def _phone(reader, writer, token: str, immediate_ok: bool = False):
+        # 挑战按连接隔离：状态在 handle 连接内部
+        session = {"challenge": "", "cmd": "", "nonce": ""}
         try:
             while True:
                 line = await reader.readline()
@@ -76,17 +86,25 @@ class TestClientProtocol(unittest.TestCase):
                     break
                 req = json.loads(line.decode("utf-8"))
                 cmd = req.get("cmd")
-                if cmd in ("lock", "applock", "unlock"):
+                if immediate_ok and cmd in ("lock", "applock", "unlock"):
+                    resp = {"ok": True, "action": cmd}  # 恶意/异常对端：不要求验证直接成功
+                elif cmd in ("lock", "applock", "unlock"):
                     if not token:
                         resp = {"ok": False, "error": "手机未设置令牌，拒绝控制命令"}
                     elif not req.get("proof"):
-                        shared["challenge"] = secrets.token_hex(16)
+                        session["challenge"] = secrets.token_hex(16)
+                        session["cmd"] = cmd
+                        session["nonce"] = str(req.get("nonce", ""))
                         resp = {"ok": False, "error": "需要配对验证", "auth": "hmac-sha256",
-                                "challenge": shared["challenge"]}
+                                "challenge": session["challenge"]}
                     else:
-                        want = hmac.new(token.encode(), shared["challenge"].encode(),
-                                        hashlib.sha256).hexdigest()
-                        if hmac.compare_digest(want, str(req.get("proof")).lower()):
+                        valid = (session["challenge"]
+                                 and session["cmd"] == cmd
+                                 and session["nonce"] == str(req.get("nonce", "")))
+                        want = auth(token, cmd, str(req.get("nonce", "")),
+                                    session["challenge"]) if valid else ""
+                        session["challenge"] = ""
+                        if valid and hmac.compare_digest(want, str(req.get("proof")).lower()):
                             resp = {"ok": True, "action": cmd}
                         else:
                             resp = {"ok": False, "error": "令牌验证失败"}
@@ -104,9 +122,8 @@ class TestClientProtocol(unittest.TestCase):
         client_mod = load_module("yuilock_client_test", os.path.join(ROOT, "client.py"))
 
         async def scenario():
-            shared = {"challenge": ""}
             server = await asyncio.start_server(
-                lambda r, w: self._phone(r, w, "TESTTOKEN", shared), "127.0.0.1", 0)
+                lambda r, w: self._phone(r, w, "TESTTOKEN"), "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             async with server:
                 good = client_mod.YuiLockClient(
@@ -139,9 +156,8 @@ class TestClientProtocol(unittest.TestCase):
         client_mod = load_module("yuilock_client_test2", os.path.join(ROOT, "client.py"))
 
         async def scenario():
-            shared = {"challenge": ""}
             server = await asyncio.start_server(
-                lambda r, w: self._phone(r, w, "", shared), "127.0.0.1", 0)
+                lambda r, w: self._phone(r, w, ""), "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             async with server:
                 c = client_mod.YuiLockClient(
@@ -149,6 +165,56 @@ class TestClientProtocol(unittest.TestCase):
                 r = await c.lock_screen()
                 self.assertFalse(r.get("ok"), r)
                 self.assertIn("未设置令牌", r.get("error", ""))
+
+        asyncio.run(scenario())
+
+    def test_proof_bound_to_cmd_and_nonce(self):
+        """裸协议：用 lock 拿到的 challenge，换成 applock 或错 nonce 的 proof 都必须被拒。"""
+
+        async def raw(reader, writer, payload):
+            writer.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await writer.drain()
+            line = await reader.readline()
+            return json.loads(line.decode("utf-8"))
+
+        async def scenario():
+            server = await asyncio.start_server(
+                lambda r, w: self._phone(r, w, "TESTTOKEN"), "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                r1 = await raw(reader, writer, {"cmd": "lock", "nonce": "N1"})
+                self.assertTrue(r1.get("challenge"), r1)
+                ch = r1["challenge"]
+                # 命令不匹配：拿 lock 的签名去开 applock
+                r2 = await raw(reader, writer, {
+                    "cmd": "applock", "nonce": "N1",
+                    "proof": auth("TESTTOKEN", "lock", "N1", ch)})
+                self.assertFalse(r2.get("ok"), r2)
+                # nonce 不匹配
+                r3 = await raw(reader, writer, {
+                    "cmd": "lock", "nonce": "OTHER",
+                    "proof": auth("TESTTOKEN", "lock", "N1", ch)})
+                self.assertFalse(r3.get("ok"), r3)
+                writer.close()
+
+        asyncio.run(scenario())
+
+    def test_direct_success_rejected(self):
+        """控制命令第一包就 ok=true 的对端（伪造/劫持），客户端必须拒绝。"""
+        client_mod = load_module("yuilock_client_test4", os.path.join(ROOT, "client.py"))
+
+        async def scenario():
+            server = await asyncio.start_server(
+                lambda r, w: self._phone(r, w, "TESTTOKEN", immediate_ok=True),
+                "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                c = client_mod.YuiLockClient(
+                    host="127.0.0.1", port=port, token="TESTTOKEN", transport="lan")
+                r = await c.lock_screen()
+                self.assertFalse(r.get("ok"), r)
+                self.assertIn("认证流程异常", r.get("error", ""))
 
         asyncio.run(scenario())
 

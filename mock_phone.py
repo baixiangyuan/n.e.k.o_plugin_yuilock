@@ -1,4 +1,4 @@
-"""模拟手机端 Yui Lock 协议（含挑战-应答认证），用于本地测试插件客户端。
+"""模拟手机端 Yui Lock 协议（挑战-应答认证：proof 绑定 cmd|nonce|challenge，按连接隔离）。
 
 用法：python mock_phone.py [端口] [token]   （token 为空 = 模拟手机未设令牌）
 """
@@ -11,10 +11,16 @@ import sys
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 48912
 TOKEN = sys.argv[2] if len(sys.argv) > 2 else ""
-state = {"challenge": ""}  # 全局：真实手机把挑战存在服务里，跨连接有效
+
+
+def auth(token: str, cmd: str, nonce: str, challenge: str) -> str:
+    msg = f"{cmd}|{nonce}|{challenge}".encode("utf-8")
+    return hmac.new(token.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
 
 async def handle(reader, writer):
+    # 挑战按连接隔离：一条连接上的验证互不打断
+    session = {"challenge": "", "cmd": "", "nonce": ""}
     try:
         while True:
             line = await reader.readline()
@@ -29,13 +35,19 @@ async def handle(reader, writer):
                 if not TOKEN:
                     resp = {"ok": False, "error": "手机未设置令牌，拒绝控制命令"}
                 elif not req.get("proof"):
-                    state["challenge"] = secrets.token_hex(16)
+                    session["challenge"] = secrets.token_hex(16)
+                    session["cmd"] = cmd
+                    session["nonce"] = str(req.get("nonce", ""))
                     resp = {"ok": False, "error": "需要配对验证", "auth": "hmac-sha256",
-                            "challenge": state["challenge"]}
+                            "challenge": session["challenge"]}
                 else:
-                    want = hmac.new(TOKEN.encode(), state["challenge"].encode(),
-                                    hashlib.sha256).hexdigest()
-                    if hmac.compare_digest(want, str(req.get("proof")).lower()):
+                    valid = (session["challenge"]
+                             and session["cmd"] == cmd
+                             and session["nonce"] == str(req.get("nonce", "")))
+                    want = auth(TOKEN, cmd, str(req.get("nonce", "")),
+                                session["challenge"]) if valid else ""
+                    session["challenge"] = ""
+                    if valid and hmac.compare_digest(want, str(req.get("proof")).lower()):
                         resp = {"ok": True, "action": cmd}
                     else:
                         resp = {"ok": False, "error": "令牌验证失败"}

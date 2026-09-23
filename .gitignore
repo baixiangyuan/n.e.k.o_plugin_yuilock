@@ -25,6 +25,7 @@ store.db
 .DS_Store
 Thumbs.db
 
-# Android 构建产物与签名密钥
+# Android 构建产物与签名密钥/口令
 android-app/out/
 *.keystore
+android-app/keystore.password

@@ -36,34 +36,42 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
-import java.security.SecureRandom;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 核心前台服务：
- * - TCP 监听（局域网）+ UDP 自动发现应答
+ * - TCP 监听（局域网）+ UDP 自动发现应答（带 nonce 回显）
  * - 蓝牙 RFCOMM(SPP) 监听
  * - 熄屏锁屏（设备管理器 lockNow）
- * - 应用锁模式：轮询前台应用，非白名单一律弹回桌面；重启自动解除
+ * - 应用锁模式：轮询前台应用，非白名单一律弹回桌面
  *
- * 加固：指令行上限 4KB、读取 20s 超时、最多 4 个并发连接、
- * 认证用一次性挑战（见 CommandHandler）。
+ * 加固：
+ * - accept 前先抢名额，收不下立刻断开；线程池队列有界；
+ *   单条连接最多 30 条命令；首包 5s 超时，之后 20s；
+ * - 认证挑战按连接隔离（CommandHandler.Session），proof 绑定 cmd|nonce|challenge；
+ * - 应用锁状态与拦截线程一致：服务重启按已保存状态恢复并做权限预检，权限缺失自动清为关。
  */
 public class LockService extends Service implements CommandHandler.Host {
 
     private static final String CHANNEL_ID = "yuilock";
     private static final int MAX_LINE = 4096;
+    private static final int INITIAL_READ_TIMEOUT_MS = 5_000;
     private static final int READ_TIMEOUT_MS = 20_000;
     private static final int MAX_CONNECTIONS = 4;
+    private static final int POOL_QUEUE_CAPACITY = 8;
+    private static final int MAX_COMMANDS_PER_CONNECTION = 30;
     public static final String SPP_UUID_STR = "00001101-0000-1000-8000-00805F9B34FB";
 
     public static volatile boolean running = false;
     public static volatile boolean btListening = false;
+    public static volatile boolean appLockRunning = false;
     public static volatile int activePort = 0;
     public static volatile String lastEvent = "—";
 
@@ -71,11 +79,11 @@ public class LockService extends Service implements CommandHandler.Host {
     private volatile DatagramSocket udpSocket;
     private volatile BluetoothServerSocket btServer;
     private volatile Thread appLockThread;
-    private final ExecutorService pool = Executors.newFixedThreadPool(MAX_CONNECTIONS);
     private final Semaphore slots = new Semaphore(MAX_CONNECTIONS);
-    private final SecureRandom random = new SecureRandom();
-    private String challenge = "";
-    private long challengeAt = 0;
+    private final ThreadPoolExecutor pool = new ThreadPoolExecutor(
+            MAX_CONNECTIONS, MAX_CONNECTIONS, 0L, TimeUnit.MILLISECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<>(POOL_QUEUE_CAPACITY),
+            new ThreadPoolExecutor.AbortPolicy());
     private WifiManager.MulticastLock multicastLock;
     private DevicePolicyManager dpm;
     private ComponentName admin;
@@ -112,9 +120,24 @@ public class LockService extends Service implements CommandHandler.Host {
         if (!running) {
             running = true;
             startListeners();
-            // 注意：应用锁不在服务重启时自动恢复——开启动作必须每次经过权限预检
+            resumeAppLockIfSaved();
         }
         return START_STICKY;
+    }
+
+    /** 服务重启（被杀拉起）：按已保存状态恢复应用锁，但必须通过权限预检，否则清为关。 */
+    private void resumeAppLockIfSaved() {
+        if (!prefs.getBoolean("applock_active", false)) {
+            return;
+        }
+        if (hasUsageAccess()) {
+            startAppLock();
+            lastEvent = "应用锁已恢复";
+        } else {
+            prefs.edit().putBoolean("applock_active", false).apply();
+            appLockRunning = false;
+            lastEvent = "应用锁：缺少使用情况访问权限，已自动关闭";
+        }
     }
 
     private int port() {
@@ -162,30 +185,27 @@ public class LockService extends Service implements CommandHandler.Host {
             try {
                 ServerSocket ss = new ServerSocket();
                 ss.setReuseAddress(true);
-                ss.bind(new InetSocketAddress(p));
+                ss.bind(new InetSocketAddress(p), 8);
                 tcpServer = ss;
                 while (running) {
                     final Socket s = ss.accept();
-                    pool.execute(() -> {
-                        if (!slots.tryAcquire()) {
-                            try {
-                                s.close();
-                            } catch (IOException ignored) {
-                            }
-                            return;
-                        }
+                    // 先抢名额再收下连接：收不下直接断开，队列不会无界堆积
+                    if (!slots.tryAcquire()) {
                         try {
-                            s.setSoTimeout(READ_TIMEOUT_MS);
-                            serve(s.getInputStream(), s.getOutputStream());
-                        } catch (Throwable ignored) {
-                        } finally {
-                            try {
-                                s.close();
-                            } catch (IOException ignored) {
-                            }
-                            slots.release();
+                            s.close();
+                        } catch (IOException ignored) {
                         }
-                    });
+                        continue;
+                    }
+                    try {
+                        pool.execute(() -> serveSocket(s));
+                    } catch (RejectedExecutionException e) {
+                        slots.release();
+                        try {
+                            s.close();
+                        } catch (IOException ignored) {
+                        }
+                    }
                 }
             } catch (Throwable t) {
                 if (running) lastEvent = "TCP 监听失败: " + t;
@@ -197,6 +217,20 @@ public class LockService extends Service implements CommandHandler.Host {
         udp.start();
         bt.start();
         lastEvent = "服务已启动";
+    }
+
+    private void serveSocket(final Socket s) {
+        try {
+            s.setSoTimeout(INITIAL_READ_TIMEOUT_MS);
+            serve(s.getInputStream(), s.getOutputStream(), s);
+        } catch (Throwable ignored) {
+        } finally {
+            try {
+                s.close();
+            } catch (IOException ignored) {
+            }
+            slots.release();
+        }
     }
 
     private void udpLoop() {
@@ -213,6 +247,15 @@ public class LockService extends Service implements CommandHandler.Host {
                 if (msg.contains("yui_lock_discover")) {
                     JSONObject reply = new JSONObject();
                     reply.put("yui_lock_service", true);
+                    // 原样回显请求里的随机数，防止旧广播包重放
+                    String nonce = "";
+                    try {
+                        nonce = new JSONObject(msg).optString("n", "");
+                    } catch (Exception ignored) {
+                    }
+                    if (!nonce.isEmpty()) {
+                        reply.put("n", nonce);
+                    }
                     reply.put("device", android.os.Build.MODEL);
                     reply.put("port", port());
                     reply.put("token_set", !prefs.getString("token", "").isEmpty());
@@ -244,44 +287,54 @@ public class LockService extends Service implements CommandHandler.Host {
             btListening = true;
             while (running) {
                 final BluetoothSocket s = bss.accept();
-                pool.execute(() -> {
-                    if (!slots.tryAcquire()) {
-                        try {
-                            s.close();
-                        } catch (IOException ignored) {
-                        }
-                        return;
-                    }
-                    // 蓝牙 socket 无 SoTimeout：用 20s 总时长看门狗兜底（客户端每命令一条连接，足够）
-                    final Thread killer = new Thread(() -> {
-                        try {
-                            Thread.sleep(READ_TIMEOUT_MS);
-                        } catch (InterruptedException ignored) {
-                            return;
-                        }
-                        try {
-                            s.close();
-                        } catch (IOException ignored) {
-                        }
-                    }, "yuilock-bt-killer");
-                    killer.start();
+                if (!slots.tryAcquire()) {
                     try {
-                        serve(s.getInputStream(), s.getOutputStream());
-                    } catch (Throwable ignored) {
-                    } finally {
-                        killer.interrupt();
-                        try {
-                            s.close();
-                        } catch (IOException ignored) {
-                        }
-                        slots.release();
+                        s.close();
+                    } catch (IOException ignored) {
                     }
-                });
+                    continue;
+                }
+                try {
+                    pool.execute(() -> serveBt(s));
+                } catch (RejectedExecutionException e) {
+                    slots.release();
+                    try {
+                        s.close();
+                    } catch (IOException ignored) {
+                    }
+                }
             }
         } catch (Throwable t) {
             if (running) lastEvent = "蓝牙: " + t;
         } finally {
             btListening = false;
+        }
+    }
+
+    private void serveBt(final BluetoothSocket s) {
+        // 蓝牙 socket 无 SoTimeout：用总时长看门狗兜底（客户端每命令一条连接，足够）
+        final Thread killer = new Thread(() -> {
+            try {
+                Thread.sleep(READ_TIMEOUT_MS);
+            } catch (InterruptedException ignored) {
+                return;
+            }
+            try {
+                s.close();
+            } catch (IOException ignored) {
+            }
+        }, "yuilock-bt-killer");
+        killer.start();
+        try {
+            serve(s.getInputStream(), s.getOutputStream(), null);
+        } catch (Throwable ignored) {
+        } finally {
+            killer.interrupt();
+            try {
+                s.close();
+            } catch (IOException ignored) {
+            }
+            slots.release();
         }
     }
 
@@ -308,12 +361,18 @@ public class LockService extends Service implements CommandHandler.Host {
         return buf.toString("UTF-8");
     }
 
-    private void serve(InputStream in, OutputStream out) {
+    private void serve(InputStream in, OutputStream out, Socket tcpSocket) {
+        CommandHandler.Session session = new CommandHandler.Session();
         try {
+            int count = 0;
             while (running) {
                 String line;
                 try {
                     line = readLineBounded(in);
+                    if (tcpSocket != null && count == 0) {
+                        // 首包必须 5 秒内到达；之后放宽到 20s
+                        tcpSocket.setSoTimeout(READ_TIMEOUT_MS);
+                    }
                 } catch (SocketTimeoutException te) {
                     return; // 空闲超时，关闭连接
                 }
@@ -324,7 +383,10 @@ public class LockService extends Service implements CommandHandler.Host {
                 if (line.isEmpty()) {
                     continue;
                 }
-                String resp = CommandHandler.handle(line, this);
+                if (++count > MAX_COMMANDS_PER_CONNECTION) {
+                    return; // 命令速率上限，防止长时间占用名额
+                }
+                String resp = CommandHandler.handle(line, this, session);
                 out.write(resp.getBytes(StandardCharsets.UTF_8));
                 out.write('\n');
                 out.flush();
@@ -343,8 +405,9 @@ public class LockService extends Service implements CommandHandler.Host {
         dpm.lockNow();
     }
 
+    /** 对外只报告拦截线程的真实运行状态 */
     public boolean isAppLockOn() {
-        return prefs.getBoolean("applock_active", false);
+        return appLockRunning;
     }
 
     public int battery() {
@@ -356,7 +419,7 @@ public class LockService extends Service implements CommandHandler.Host {
         }
     }
 
-    /** 权限预检通过才写入状态并启动拦截线程（P2：避免“显示已开启但没生效”） */
+    /** 权限预检通过才写状态并启动拦截线程；关闭永远成功 */
     public synchronized boolean setAppLock(boolean on) {
         if (on) {
             if (!hasUsageAccess()) {
@@ -374,25 +437,6 @@ public class LockService extends Service implements CommandHandler.Host {
         return true;
     }
 
-    public synchronized String newChallenge() {
-        StringBuilder sb = new StringBuilder(32);
-        for (int i = 0; i < 32; i++) {
-            sb.append("0123456789abcdef".charAt(random.nextInt(16)));
-        }
-        challenge = sb.toString();
-        challengeAt = System.currentTimeMillis();
-        return challenge;
-    }
-
-    public synchronized String takeChallenge() {
-        String c = challenge;
-        challenge = "";
-        if (c.isEmpty() || System.currentTimeMillis() - challengeAt > 60_000) {
-            return "";
-        }
-        return c;
-    }
-
     private boolean hasUsageAccess() {
         try {
             AppOpsManager ops = (AppOpsManager) getSystemService(APP_OPS_SERVICE);
@@ -405,49 +449,57 @@ public class LockService extends Service implements CommandHandler.Host {
 
     private synchronized void startAppLock() {
         if (appLockThread != null && appLockThread.isAlive()) {
+            appLockRunning = true;
             return;
         }
         appLockThread = new Thread(() -> {
+            appLockRunning = true;
             UsageStatsManager usm = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
-            while (running && prefs.getBoolean("applock_active", false)) {
-                try {
-                    long now = System.currentTimeMillis();
-                    UsageEvents ev = usm.queryEvents(now - 3000, now);
-                    UsageEvents.Event e = new UsageEvents.Event();
-                    String top = null;
-                    while (ev.hasNextEvent()) {
-                        ev.getNextEvent(e);
-                        if (e.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND) {
-                            top = e.getPackageName();
-                        }
-                    }
-                    if (top != null && !whitelist.contains(top)) {
-                        Intent home = new Intent(Intent.ACTION_MAIN)
-                                .addCategory(Intent.CATEGORY_HOME)
-                                .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        startActivity(home);
-                        lastEvent = "应用锁拦截: " + top;
-                    }
-                    Thread.sleep(300);
-                } catch (InterruptedException ie) {
-                    return;
-                } catch (Throwable t) {
+            try {
+                while (running && prefs.getBoolean("applock_active", false)) {
                     try {
-                        Thread.sleep(500);
+                        long now = System.currentTimeMillis();
+                        UsageEvents ev = usm.queryEvents(now - 3000, now);
+                        UsageEvents.Event e = new UsageEvents.Event();
+                        String top = null;
+                        while (ev.hasNextEvent()) {
+                            ev.getNextEvent(e);
+                            if (e.getEventType() == UsageEvents.Event.MOVE_TO_FOREGROUND) {
+                                top = e.getPackageName();
+                            }
+                        }
+                        if (top != null && !whitelist.contains(top)) {
+                            Intent home = new Intent(Intent.ACTION_MAIN)
+                                    .addCategory(Intent.CATEGORY_HOME)
+                                    .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            startActivity(home);
+                            lastEvent = "应用锁拦截: " + top;
+                        }
+                        Thread.sleep(300);
                     } catch (InterruptedException ie) {
                         return;
+                    } catch (Throwable t) {
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException ie) {
+                            return;
+                        }
                     }
                 }
+            } finally {
+                appLockRunning = false;
             }
         }, "yuilock-applock");
         appLockThread.start();
     }
 
     private synchronized void stopAppLock() {
+        prefs.edit().putBoolean("applock_active", false).apply();
         if (appLockThread != null) {
             appLockThread.interrupt();
             appLockThread = null;
         }
+        appLockRunning = false;
     }
 
     @Override

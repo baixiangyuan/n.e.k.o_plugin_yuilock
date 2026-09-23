@@ -63,6 +63,8 @@ OPTS = ARGS.parse_args()
 
 SELF_PATH = os.path.abspath(sys.executable).lower()
 ALLOW_PATHS = {os.path.abspath(p).lower() for p in OPTS.allow}
+# N.E.K.O. 组件大多与 --allow 传入的可执行文件同安装目录（Electron/后端同目录树）
+TRUSTED_DIRS = {os.path.dirname(p) for p in ALLOW_PATHS}
 
 
 def exe_path(pid: int) -> str:
@@ -79,67 +81,21 @@ def exe_path(pid: int) -> str:
         kernel32.CloseHandle(h)
 
 
-class PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ("dwSize", wintypes.DWORD),
-        ("cntUsage", wintypes.DWORD),
-        ("th32ProcessID", wintypes.DWORD),
-        ("th32DefaultHeapID", ctypes.c_size_t),
-        ("th32ModuleID", wintypes.DWORD),
-        ("cntThreads", wintypes.DWORD),
-        ("th32ParentProcessID", wintypes.DWORD),
-        ("pcPriClassBase", ctypes.c_long),
-        ("dwFlags", wintypes.DWORD),
-        ("szExeFile", ctypes.c_wchar * 260),
-    ]
-
-
-def scan_process_paths() -> list[tuple[int, str]]:
-    """枚举当前所有进程，返回 [(pid, 完整路径)]。"""
-    out = []
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == -1 or not snap:
-        return out
-    try:
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
-        while ok:
-            pid = entry.th32ProcessID
-            path = exe_path(pid)
-            if path:
-                out.append((pid, path))
-            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
-    finally:
-        kernel32.CloseHandle(snap)
-    return out
-
-
-def build_trusted_paths() -> set[str]:
-    """启动时确定可信可执行文件集合（完整路径精确匹配）：
-    - 进程名含 neko 的（N.E.K.O. 本体及其组件）；
-    - 命令行 --allow 传入的路径。"""
-    trusted = set(ALLOW_PATHS)
-    for pid, path in scan_process_paths():
-        if "neko" in norm_name(os.path.basename(path)):
-            trusted.add(path.lower())
-    return trusted
-
-
-TRUSTED_PATHS = build_trusted_paths()
-
-
 def allowed_pid(pid: int) -> bool:
     if pid in (0, 4):
         return True
     path = exe_path(pid)
+    # 查不到路径（权限不足等）一律拒绝放行，宁可错关不可放过未知进程
     if not path:
-        return True
-    name = norm_name(os.path.basename(path))
+        return False
+    # 用「去掉扩展名的主名」规范化，与白名单同一标准：explorer.exe -> explorer
+    name = norm_name(os.path.splitext(os.path.basename(path))[0])
     if name in WHITELIST_BASE:
         return True
     lp = path.lower()
-    if lp in TRUSTED_PATHS or lp == SELF_PATH:
+    if lp == SELF_PATH or lp in ALLOW_PATHS:
+        return True
+    if os.path.dirname(lp) in TRUSTED_DIRS:
         return True
     return False
 

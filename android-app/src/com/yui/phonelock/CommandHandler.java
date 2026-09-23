@@ -4,6 +4,7 @@ import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -13,12 +14,49 @@ import javax.crypto.spec.SecretKeySpec;
  *
  * 安全设计：
  * - ping 无需认证（只返回无害状态）；
- * - lock/applock/unlock 必须通过挑战-应答认证：手机下发一次性 challenge，
- *   客户端回 proof = HMAC-SHA256(token, challenge)。token 不在网络上明文出现，
- *   challenge 单次有效且 60 秒过期，无法重放；
+ * - lock/applock/unlock 必须通过挑战-应答认证，且挑战按连接隔离（Session）：
+ *   客户端第一包 {cmd, nonce} → 手机回一次性 challenge →
+ *   客户端同连接回 {cmd, nonce, proof = HMAC-SHA256(token, "cmd|nonce|challenge")}；
+ *   proof 与命令、nonce、挑战三者绑定，不可挪用、不可重放，连接之间互不打断；
+ * - 控制命令不带 proof 直接 ok=true 的情况不存在（服务端不会这么回）；
  * - 手机端 token 为空时直接拒绝一切控制命令。
  */
 public final class CommandHandler {
+
+    /** 每条连接一个：挑战与所属命令/nonce 绑定，取后即焚，60 秒过期。 */
+    public static final class Session {
+        private static final SecureRandom RANDOM = new SecureRandom();
+        String challenge = "";
+        String cmd = "";
+        String nonce = "";
+        long at = 0;
+
+        void issue(String cmd, String nonce) {
+            StringBuilder sb = new StringBuilder(32);
+            for (int i = 0; i < 32; i++) {
+                sb.append("0123456789abcdef".charAt(RANDOM.nextInt(16)));
+            }
+            this.challenge = sb.toString();
+            this.cmd = cmd;
+            this.nonce = nonce == null ? "" : nonce;
+            this.at = System.currentTimeMillis();
+        }
+
+        String take(String cmd, String nonce) {
+            if (challenge.isEmpty()
+                    || !this.cmd.equals(cmd)
+                    || !this.nonce.equals(nonce == null ? "" : nonce)
+                    || System.currentTimeMillis() - at > 60_000) {
+                challenge = "";
+                return "";
+            }
+            String c = challenge;
+            challenge = "";
+            this.cmd = "";
+            this.nonce = "";
+            return c;
+        }
+    }
 
     public interface Host {
         String token();
@@ -33,18 +71,12 @@ public final class CommandHandler {
         boolean setAppLock(boolean on);
 
         int battery();
-
-        /** 生成并存一次性挑战 */
-        String newChallenge();
-
-        /** 取走当前挑战（取后即焚）；无或过期返回 "" */
-        String takeChallenge();
     }
 
     private CommandHandler() {
     }
 
-    public static String handle(String line, Host h) {
+    public static String handle(String line, Host h, Session session) {
         try {
             JSONObject req = new JSONObject(line.trim());
             String cmd = req.optString("cmd", "");
@@ -60,19 +92,21 @@ public final class CommandHandler {
                 return fail("手机端未设置配对令牌，已拒绝控制命令（请在 Yui Lock 设置里配置令牌）");
             }
             String proof = req.optString("proof", "");
+            String nonce = req.optString("nonce", "");
             if (proof.isEmpty()) {
+                session.issue(cmd, nonce);
                 JSONObject o = new JSONObject();
                 o.put("ok", false);
                 o.put("error", "需要配对验证");
                 o.put("auth", "hmac-sha256");
-                o.put("challenge", h.newChallenge());
+                o.put("challenge", session.challenge);
                 return o.toString();
             }
-            String challenge = h.takeChallenge();
+            String challenge = session.take(cmd, nonce);
             if (challenge.isEmpty()) {
-                return fail("验证挑战已过期，请重新发起命令");
+                return fail("验证挑战无效或已过期，请重新发起命令");
             }
-            String want = hmacSha256Hex(expect, challenge);
+            String want = hmacSha256Hex(expect, cmd + "|" + nonce + "|" + challenge);
             if (!constantTimeEquals(want, proof)) {
                 return fail("令牌验证失败");
             }

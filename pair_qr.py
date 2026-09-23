@@ -4,17 +4,20 @@
 用法（在插件目录下）：
     uv run --with qrcode --with pillow python pair_qr.py
 或已安装依赖时：
-    python pair_qr.py [--host 局域网IP] [--port 48912] [--token 令牌]
+    python pair_qr.py [--host 局域网IP] [--port 48912] [--token 令牌] [--no-save]
 
-不带参数时自动读取同目录 plugin.toml 的 [yuilock] 配置；
-host=auto 时自动探测本机局域网 IP；token 为空时随机生成一个并回显（记得同步到 plugin.toml）。
+- 配置里 token 为空时会随机生成一个，并自动写回 plugin.toml 的 [yuilock] token
+  （写回后请在插件卡片上点「重载」使其生效；--no-save 可跳过写回）。
+- 二维码图片保存在系统临时目录（不落在插件目录里，避免令牌被一起提交/分享）。
 """
 from __future__ import annotations
 
 import argparse
+import re
 import secrets
 import socket
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -42,11 +45,36 @@ def load_config() -> dict:
         return {}
 
 
+def save_token_to_toml(token: str) -> bool:
+    """把生成的 token 写回 plugin.toml 的 [yuilock] 段（只替换该段内的空 token）。"""
+    path = ROOT / "plugin.toml"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except Exception:
+        return False
+    in_section = False
+    pattern = re.compile(r"^(\s*token\s*=\s*)\"\"\s*$")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = stripped == "[yuilock]"
+            continue
+        if in_section and pattern.match(line):
+            lines[i] = pattern.sub(r'\g<1>"%s"' % token, line, count=1)
+            try:
+                path.write_text("".join(lines), encoding="utf-8")
+                return True
+            except Exception:
+                return False
+    return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Yui Lock 配对二维码")
     ap.add_argument("--host", help="局域网 IP（默认自动探测）")
     ap.add_argument("--port", type=int, help="端口（默认读配置，其次 48912）")
-    ap.add_argument("--token", help="配对令牌（默认读配置，为空则随机生成）")
+    ap.add_argument("--token", help="配对令牌（默认读配置，为空则随机生成并写回配置）")
+    ap.add_argument("--no-save", action="store_true", help="不把生成的令牌写回 plugin.toml")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -55,8 +83,15 @@ def main() -> None:
     token = args.token or str(cfg.get("token", "") or "")
     if not token:
         token = "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(12))
-        print(f"[!] 配置里没有 token，已随机生成：{token}")
-        print("    请把它同步写入 plugin.toml 的 [yuilock] token = \"...\"，然后重载插件。")
+        if args.no_save:
+            print(f"[!] 配置里没有 token，已随机生成：{token}")
+            print("    (--no-save) 未写回，请自行同步到 plugin.toml 的 [yuilock] token")
+        elif save_token_to_toml(token):
+            print(f"[!] 配置里没有 token，已随机生成并写回 plugin.toml：{token}")
+            print("    请在插件管理器里对本插件点「重载」使其生效。")
+        else:
+            print(f"[!] 配置里没有 token，已随机生成：{token}")
+            print(f"    [!] 写回 plugin.toml 失败，请手动把 token = \"{token}\" 填进 [yuilock] 段。")
 
     payload = f"yuilock://pair?h={host}&p={port}&t={token}"
     print(f"配对信息：{payload}")
@@ -74,9 +109,13 @@ def main() -> None:
     qr.make(fit=True)
     img = qr.make_image()
 
-    png_path = ROOT / "pair_qr.png"
-    img.save(png_path)
-    print(f"二维码已保存：{png_path}")
+    # 二维码里含令牌：存到系统临时目录，不放插件目录（避免被提交/分享带走）
+    png_path = Path(tempfile.gettempdir()) / "yuilock_pair_qr.png"
+    try:
+        img.save(png_path)
+        print(f"二维码已保存：{png_path}")
+    except Exception as exc:
+        print(f"[!] 二维码保存失败（不影响窗口显示）：{exc}")
 
     shown = False
     try:

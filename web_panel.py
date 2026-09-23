@@ -5,6 +5,13 @@
 - 按钮：锁手机屏幕 / 手机应用锁 / 解锁手机 / 锁电脑 / 解锁电脑
 - 配对二维码（手机 App「扫码配对」用）
 
+安全：
+- 只监听 127.0.0.1；
+- 校验 Host 头（防 DNS rebinding）；
+- POST 动作必须带自定义头 X-YuiLock-Panel（跨站请求无法携带自定义头，
+  浏览器会先发 CORS 预检并失败），且危险操作有 JS confirm；
+- /api/status 不回显配对令牌。
+
 用法（插件目录下）：
     uv run --with qrcode --with pillow python web_panel.py [--port 48913]
 
@@ -58,13 +65,16 @@ CLIENT = YuiLockClient(
 )
 TOKEN = str(CFG.get("token", "") or "")
 PORT = int(CFG.get("port", 48912) or 48912)
-PAIR_URI = f"yuilock://pair?h={detect_lan_ip()}&p={PORT}&t={TOKEN}"
+LAN_IP = detect_lan_ip()
+PAIR_URI = f"yuilock://pair?h={LAN_IP}&p={PORT}&t={TOKEN}"
+ALLOW_EXES = [sys.executable] + [str(p) for p in (CFG.get("pc_allow") or [])]
 
 ACTIONS = {
     "lock_screen": lambda: CLIENT.lock_screen(),
     "lock_apps": lambda: CLIENT.lock_apps(),
     "unlock_phone": lambda: CLIENT.unlock(),
 }
+DANGEROUS = {"lock_screen", "lock_apps", "lock_pc"}
 
 
 def run_action(name: str) -> dict:
@@ -73,7 +83,7 @@ def run_action(name: str) -> dict:
     if name == "lock_pc":
         if pclock.is_locker_alive():
             return {"ok": True, "message": "电脑已经处于锁定状态"}
-        r = pclock.spawn_locker(LOCKER, allow_exes=[sys.executable])
+        r = pclock.spawn_locker(LOCKER, allow_exes=ALLOW_EXES)
         if r.get("ok"):
             return {"ok": True, "message": "电脑已锁定：打开任何程序都会被立即弹回桌面"}
         return {"ok": False, "message": f"锁定失败：{r.get('error')}"}
@@ -105,10 +115,10 @@ img{width:200px;height:200px;background:#fff;border-radius:10px}
 <div id="status">加载中…</div>
 <div class="row">
 <div>
-<button onclick="act('lock_screen')">锁手机屏幕</button>
-<button onclick="act('lock_apps')">手机应用锁</button>
+<button data-danger="1" onclick="act('lock_screen')">锁手机屏幕</button>
+<button data-danger="1" onclick="act('lock_apps')">手机应用锁</button>
 <button class="gray" onclick="act('unlock_phone')">解锁手机</button><br>
-<button onclick="act('lock_pc')">锁电脑</button>
+<button data-danger="1" onclick="act('lock_pc')">锁电脑</button>
 <button class="gray" onclick="act('unlock_pc')">解锁电脑</button>
 </div>
 <div style="text-align:center">
@@ -124,8 +134,12 @@ async function refresh(){
   document.getElementById('status').textContent='面板服务异常';}
 }
 async function act(name){
+  const danger=document.querySelector(`button[onclick="act('${name}')"]`).dataset.danger==='1';
+  if(danger&&!confirm('确定执行「'+name+'」？'))return;
   document.getElementById('msg').textContent='执行中…';
-  try{const r=await fetch('/api/action',{method:'POST',body:JSON.stringify({action:name})});
+  try{const r=await fetch('/api/action',{method:'POST',
+    headers:{'X-YuiLock-Panel':'1','Content-Type':'application/json'},
+    body:JSON.stringify({action:name})});
   const j=await r.json();document.getElementById('msg').textContent=j.message||JSON.stringify(j);}
   catch(e){document.getElementById('msg').textContent='请求失败：'+e;}
   refresh();
@@ -135,6 +149,11 @@ refresh();setInterval(refresh,3000);
 
 
 class Handler(BaseHTTPRequestHandler):
+
+    def _host_ok(self) -> bool:
+        """防 DNS rebinding：Host 必须是 127.0.0.1 / localhost。"""
+        host = (self.headers.get("Host") or "").lower()
+        return host.startswith("127.0.0.1") or host.startswith("localhost")
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
@@ -149,6 +168,9 @@ class Handler(BaseHTTPRequestHandler):
                    "application/json; charset=utf-8")
 
     def do_GET(self):
+        if not self._host_ok():
+            self._send(403, b"forbidden", "text/plain")
+            return
         if self.path == "/":
             self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path == "/api/status":
@@ -166,7 +188,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 phone = f"不在线（{p.get('error', '无响应')}）"
             self._json({"text": f"手机：{phone}\n电脑锁：{'🔒 已锁定' if pc else '未锁定'}\n"
-                                f"配对码：{PAIR_URI}"})
+                                f"配对令牌：{'已设置' if TOKEN else '⚠ 未设置'}\n"
+                                f"局域网地址：{LAN_IP}:{PORT}"})
         elif self.path == "/qr.png":
             try:
                 import qrcode
@@ -183,8 +206,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        if not self._host_ok():
+            self._send(403, b"forbidden", "text/plain")
+            return
         if self.path != "/api/action":
             self._send(404, b"not found", "text/plain")
+            return
+        # 防跨站：任意网页向 localhost POST 时带不了自定义头（会先触发 CORS 预检并失败）
+        if (self.headers.get("X-YuiLock-Panel") or "") != "1":
+            self._send(403, b"forbidden", "text/plain")
             return
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)

@@ -150,7 +150,8 @@ class YuiLockPlugin(NekoPluginBase):
         script = self._locker_script()
         if not script.is_file():
             return "找不到 pc_locker.py，无法锁定电脑。"
-        r = pclock.spawn_locker(script, allow_exes=[sys.executable])
+        allow = [sys.executable] + [str(p) for p in (self._cfg.get("pc_allow") or [])]
+        r = pclock.spawn_locker(script, allow_exes=allow)
         if r.get("ok"):
             return ("电脑已锁定：主人打开的任何程序都会被立即弹回桌面（N.E.K.O. 不受影响）。"
                     + (f"原因：{reason}" if reason else ""))
