@@ -1,13 +1,21 @@
 """手机客户端：局域网（asyncio TCP + UDP 自动发现）+ 蓝牙（winrt，可选）。
 
-协议：NDJSON。发送一行 JSON，收到一行 JSON。
-纯标准库；蓝牙通道需要可选安装 winrt-* 包（未安装时返回带指引的错误）。
+安全设计：token 不在任何通道上明文传输。控制命令采用挑战-应答认证：
+1) 客户端发送控制命令 → 手机返回一次性随机 challenge；
+2) 客户端回发 proof = HMAC-SHA256(token, challenge)；
+3) 手机校验通过才执行。局域网监听者拿不到 token，也无法重放（challenge 单次有效）。
+
+协议：NDJSON。纯标准库；蓝牙通道需要可选安装 winrt-* 包。
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 from typing import Any, Optional
+
+CONTROL_CMDS = {"lock", "applock", "unlock"}
 
 
 class YuiLockClient:
@@ -110,9 +118,23 @@ class YuiLockClient:
     # ---------------- 对外 ----------------
 
     async def send(self, payload: dict, timeout: float = 8.0) -> dict:
+        """发送命令。控制命令自动完成挑战-应答认证，token 不出网。"""
         payload = dict(payload)
-        if self.token:
-            payload["token"] = self.token
+        cmd = payload.get("cmd")
+        if cmd in CONTROL_CMDS:
+            if not self.token:
+                return {"ok": False,
+                        "error": "插件未配置 token（手机端已启用配对令牌校验，请在 plugin.toml [yuilock] 填写）"}
+            first = await self._transact(dict(payload), timeout)
+            if first.get("auth") == "hmac-sha256" and first.get("challenge"):
+                proof = hmac.new(self.token.encode("utf-8"),
+                                 str(first["challenge"]).encode("utf-8"),
+                                 hashlib.sha256).hexdigest()
+                return await self._transact(dict(payload, proof=proof), timeout)
+            return first
+        return await self._transact(payload, timeout)
+
+    async def _transact(self, payload: dict, timeout: float) -> dict:
         channels = ["bt"] if self.transport == "bt" else (
             ["lan"] if self.transport == "lan" else ["lan", "bt"])
         errors = []

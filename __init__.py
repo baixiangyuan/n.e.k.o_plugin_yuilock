@@ -6,12 +6,12 @@
 - lock_pc                       锁电脑（打开任何程序立即弹回桌面，N.E.K.O. 不受影响）
 - unlock_pc                     解锁电脑
 
-电脑锁由插件目录下的 pc_locker.py 实现；秘密按键组合可解锁（界面上不提示）；
-重启电脑即解锁。手机应用锁重启即解除。
+安全：控制命令走挑战-应答认证（token 不明文传输）；手机端 token 为空时拒绝控制。
+电脑锁由 pc_locker.py 实现（完整路径白名单 + 防误杀的解锁校验）；秘密按键可解锁；
+重启电脑即解锁。
 """
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,10 +26,10 @@ from plugin.sdk.plugin import (
     plugin_entry,
 )
 
+from . import pclock
 from .client import YuiLockClient
 
 TOOL_TIMEOUT = 15.0
-CREATE_NO_WINDOW = 0x08000000
 
 REASON_NOTE = {
     "type": "object",
@@ -46,7 +46,6 @@ class YuiLockPlugin(NekoPluginBase):
         super().__init__(ctx)
         self._cfg: dict[str, Any] = {}
         self.client: YuiLockClient | None = None
-        self._pc_lock_proc = None
 
     # ---------------- 生命周期 ----------------
 
@@ -71,25 +70,8 @@ class YuiLockPlugin(NekoPluginBase):
     def _locker_script(self) -> Path:
         return Path(__file__).resolve().parent / "pc_locker.py"
 
-    def _pid_file(self) -> Path:
-        return self.storage_dir / "pc_lock.pid"
-
     def _pc_lock_alive(self) -> bool:
-        try:
-            pid = int(self._pid_file().read_text().strip())
-        except Exception:
-            return False
-        if sys.platform != "win32":
-            return False
-        try:
-            import ctypes
-            k32 = ctypes.WinDLL("kernel32")
-            h = k32.OpenProcess(0x1000, False, pid)
-            if not h:
-                return False
-            return k32.WaitForSingleObject(h, 0) == 0x00000102  # WAIT_TIMEOUT = 存活
-        except Exception:
-            return False
+        return pclock.is_locker_alive()
 
     async def _do_lock_phone(self, mode: str, reason: str) -> dict:
         if mode == "apps":
@@ -101,7 +83,7 @@ class YuiLockPlugin(NekoPluginBase):
         if isinstance(r, dict) and r.get("ok"):
             return {"summary": act + (f"。原因：{reason}" if reason else "")}
         err = (r or {}).get("error", "手机无响应")
-        return {"summary": f"锁手机失败：{err}。检查：手机 Yui Lock 服务是否启动、是否与电脑同一 Wi-Fi、token 是否一致。"}
+        return {"summary": f"锁手机失败：{err}。检查：手机 Yui Lock 服务是否启动、是否与电脑同一 Wi-Fi、plugin.toml 的 token 是否与手机一致。"}
 
     async def _do_unlock_phone(self, reason: str) -> dict:
         r = await self.client.unlock()
@@ -113,39 +95,21 @@ class YuiLockPlugin(NekoPluginBase):
     def _do_lock_pc(self, reason: str) -> str:
         if self._pc_lock_alive():
             return "电脑已经在锁定状态了。" + (f"原因：{reason}" if reason else "")
-        if sys.platform != "win32":
-            return "锁定电脑目前只支持 Windows。"
         script = self._locker_script()
         if not script.is_file():
             return "找不到 pc_locker.py，无法锁定电脑。"
-        python = Path(sys.executable)
-        pythonw = python.with_name("pythonw.exe")
-        exe = str(pythonw if pythonw.exists() else python)
-        try:
-            proc = subprocess.Popen(
-                [exe, str(script), "--allow", sys.executable],
-                creationflags=CREATE_NO_WINDOW,
-                cwd=str(script.parent),
-            )
-            self._pid_file().write_text(str(proc.pid))
-            self._pc_lock_proc = proc
-        except Exception as exc:
-            return f"锁定电脑失败：{exc}"
-        return ("电脑已锁定：主人打开的任何程序都会被立即弹回桌面（N.E.K.O. 不受影响）。"
-                + (f"原因：{reason}" if reason else ""))
+        r = pclock.spawn_locker(script, allow_exes=[sys.executable])
+        if r.get("ok"):
+            return ("电脑已锁定：主人打开的任何程序都会被立即弹回桌面（N.E.K.O. 不受影响）。"
+                    + (f"原因：{reason}" if reason else ""))
+        return f"锁定电脑失败：{r.get('error')}"
 
     def _do_unlock_pc(self, reason: str) -> str:
-        if not self._pc_lock_alive() and not self._pid_file().exists():
-            return "电脑当前没有锁定。" + (f"（{reason}）" if reason else "")
-        try:
-            pid = int(self._pid_file().read_text().strip())
-            if sys.platform == "win32":
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                               capture_output=True, creationflags=CREATE_NO_WINDOW)
-            self._pid_file().unlink(missing_ok=True)
-        except Exception:
-            pass
-        return "电脑已解锁，恢复自由。" + (f"（{reason}）" if reason else "")
+        alive, msg = pclock.kill_locker()
+        out = msg + "。"
+        if reason:
+            out += f"（{reason}）"
+        return out
 
     # ---------------- LLM 工具 ----------------
 
@@ -219,9 +183,10 @@ class YuiLockPlugin(NekoPluginBase):
             p = await self.client.ping()
             pc = self._pc_lock_alive()
             if isinstance(p, dict) and p.get("ok"):
+                token_note = "" if p.get("token_set") else "（⚠ 手机未设令牌，控制命令被拒绝）"
                 s = (f"手机：在线（{p.get('device', '?')}，电量 {p.get('battery', '?')}%，"
                      f"锁屏权限{'有' if p.get('admin') else '未激活'}，"
-                     f"应用锁{'开' if p.get('applock') else '关'}）；"
+                     f"应用锁{'开' if p.get('applock') else '关'}）{token_note}；"
                      f"电脑锁：{'开' if pc else '关'}")
             else:
                 s = f"手机：不在线（{(p or {}).get('error', '无响应')}）；电脑锁：{'开' if pc else '关'}"

@@ -1,22 +1,22 @@
-"""Yui PC 锁机程序（由 N.E.K.O. 插件调起，也可手动运行）。
+"""Yui PC 锁机程序（由 N.E.K.O. 插件或 web_panel.py 调起）。
 
 锁定期间：
-- 打开的任何程序窗口都会被立即关闭（弹回桌面），N.E.K.O. 与系统外壳不受影响；
+- 打开的任何程序窗口都会被立即关闭（弹回桌面）；
+- N.E.K.O. 只按「启动时扫描到的完整可执行路径」放行（不做名字模糊匹配）；
+- 系统外壳（explorer/搜索/输入法等）按进程名放行；
 - Win 键、Alt+Tab 被拦截；
 - 屏幕右上角显示一个小的「已锁定」角标（不提示任何解锁方式）。
 
-解锁方式（对用户不可见）：
-- 秘密按键组合（↑ ↑ ↓ ↓ ← → ← → B A）；
-- N.E.K.O. 插件结束本进程（unlock_pc 工具）；
-- 重启电脑即自动解锁（本程序不写开机自启）。
+解锁方式（对用户不可见）：秘密按键组合（↑↑↓↓←→←→BA）、插件/面板结束本进程、重启电脑。
 
 用法：
-    pythonw pc_locker.py [--allow 可放行的程序路径 ...]
+    pythonw pc_locker.py --instance <uuid> --state <状态文件> [--allow 可放行程序路径 ...]
 """
 from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import re
 import subprocess
@@ -38,30 +38,31 @@ NAME_BY_VK = {v: k for k, v in VK_BY_NAME.items()}
 KONAMI = ["up", "up", "down", "down", "left", "right", "left", "right", "b", "a"]
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-WAIT_TIMEOUT = 0x00000102
+TH32CS_SNAPPROCESS = 0x2
 CREATE_NO_WINDOW = 0x08000000
 
 state = {"unlocked": False}
 
-# 永远放行的系统外壳 / 输入法 / 搜索等（不含可用来绕锁的资源管理器窗口会被保留，但点开的程序仍会被关）
+# 系统外壳 / 搜索 / 输入法（有窗口但不是"应用"）
 WHITELIST_BASE = {
     "explorer", "system", "searchhost", "startmenuexperiencehost",
     "shellexperiencehost", "textinputhost", "lockapp", "runtimebroker",
 }
 
 
-def norm(s: str) -> str:
+def norm_name(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
 ARGS = argparse.ArgumentParser()
+ARGS.add_argument("--instance", required=True, help="本次锁定的唯一标识（写入命令行，供 unlock 校验）")
+ARGS.add_argument("--state", required=True, help="状态文件路径")
 ARGS.add_argument("--allow", action="append", default=[],
                   help="额外放行的程序完整路径（如 N.E.K.O. 的 python.exe）")
 OPTS = ARGS.parse_args()
 
-ALLOW_PATHS = {norm(os.path.abspath(p)) for p in OPTS.allow}
-ALLOW_NAMES = {norm(os.path.basename(p)) for p in OPTS.allow}
-SELF_NAME = norm(os.path.basename(sys.executable))
+SELF_PATH = os.path.abspath(sys.executable).lower()
+ALLOW_PATHS = {os.path.abspath(p).lower() for p in OPTS.allow}
 
 
 def exe_path(pid: int) -> str:
@@ -78,22 +79,84 @@ def exe_path(pid: int) -> str:
         kernel32.CloseHandle(h)
 
 
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+def scan_process_paths() -> list[tuple[int, str]]:
+    """枚举当前所有进程，返回 [(pid, 完整路径)]。"""
+    out = []
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == -1 or not snap:
+        return out
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            pid = entry.th32ProcessID
+            path = exe_path(pid)
+            if path:
+                out.append((pid, path))
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return out
+
+
+def build_trusted_paths() -> set[str]:
+    """启动时确定可信可执行文件集合（完整路径精确匹配）：
+    - 进程名含 neko 的（N.E.K.O. 本体及其组件）；
+    - 命令行 --allow 传入的路径。"""
+    trusted = set(ALLOW_PATHS)
+    for pid, path in scan_process_paths():
+        if "neko" in norm_name(os.path.basename(path)):
+            trusted.add(path.lower())
+    return trusted
+
+
+TRUSTED_PATHS = build_trusted_paths()
+
+
 def allowed_pid(pid: int) -> bool:
     if pid in (0, 4):
         return True
     path = exe_path(pid)
-    name = norm(os.path.basename(path))
-    if not name:
+    if not path:
         return True
+    name = norm_name(os.path.basename(path))
     if name in WHITELIST_BASE:
         return True
-    npath = norm(path)
-    # N.E.K.O. 本体：可执行文件名或路径里带 neko
-    if "neko" in npath or "neko" in name:
-        return True
-    if npath in ALLOW_PATHS or name in ALLOW_NAMES or name == SELF_NAME:
+    lp = path.lower()
+    if lp in TRUSTED_PATHS or lp == SELF_PATH:
         return True
     return False
+
+
+def write_state() -> None:
+    try:
+        with open(OPTS.state, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "instance": OPTS.instance}, f)
+    except Exception:
+        pass
+
+
+def clear_state() -> None:
+    try:
+        os.remove(OPTS.state)
+    except Exception:
+        pass
 
 
 def minimize_all() -> None:
@@ -194,6 +257,7 @@ def banner() -> None:
 
 
 def main() -> None:
+    write_state()
     minimize_all()
     threading.Thread(target=hook_thread, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
@@ -203,6 +267,7 @@ def main() -> None:
             time.sleep(0.25)
     except KeyboardInterrupt:
         pass
+    clear_state()
 
 
 if __name__ == "__main__":

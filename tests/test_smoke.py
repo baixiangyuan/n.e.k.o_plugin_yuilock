@@ -1,15 +1,18 @@
 """
 Yui 手机/电脑锁 - 冒烟测试
 
-校验插件结构、plugin.toml 入口、手机客户端协议逻辑（不依赖 plugin.sdk）。
+校验插件结构、plugin.toml 入口、手机客户端协议（含挑战-应答认证，不依赖 plugin.sdk）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import importlib.util
 import json
 import os
+import secrets
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,34 +55,58 @@ class TestPluginStructure(unittest.TestCase):
     def test_sources_parse(self):
         import ast
 
-        for name in ("__init__.py", "client.py", "pc_locker.py"):
+        for name in ("__init__.py", "client.py", "pclock.py",
+                     "pc_locker.py", "pair_qr.py", "web_panel.py"):
             path = os.path.join(ROOT, name)
+            self.assertTrue(os.path.isfile(path), f"缺少文件: {name}")
             with open(path, encoding="utf-8") as f:
                 ast.parse(f.read(), path)
-        self.assertTrue(True)
 
 
 class TestClientProtocol(unittest.TestCase):
-    def test_send_roundtrip(self):
+    """对内置模拟手机验证：ping 免认证；控制命令走挑战-应答；错 token 被拒；
+    客户端未配 token 时拒绝发起控制。"""
+
+    @staticmethod
+    async def _phone(reader, writer, token: str, shared: dict):
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                req = json.loads(line.decode("utf-8"))
+                cmd = req.get("cmd")
+                if cmd in ("lock", "applock", "unlock"):
+                    if not token:
+                        resp = {"ok": False, "error": "手机未设置令牌，拒绝控制命令"}
+                    elif not req.get("proof"):
+                        shared["challenge"] = secrets.token_hex(16)
+                        resp = {"ok": False, "error": "需要配对验证", "auth": "hmac-sha256",
+                                "challenge": shared["challenge"]}
+                    else:
+                        want = hmac.new(token.encode(), shared["challenge"].encode(),
+                                        hashlib.sha256).hexdigest()
+                        if hmac.compare_digest(want, str(req.get("proof")).lower()):
+                            resp = {"ok": True, "action": cmd}
+                        else:
+                            resp = {"ok": False, "error": "令牌验证失败"}
+                else:
+                    resp = {"ok": True, "action": cmd}
+                    if cmd == "ping":
+                        resp.update({"device": "MockPhone", "battery": 88,
+                                     "token_set": bool(token)})
+                writer.write((json.dumps(resp) + "\n").encode("utf-8"))
+                await writer.drain()
+        finally:
+            writer.close()
+
+    def test_full_flow(self):
         client_mod = load_module("yuilock_client_test", os.path.join(ROOT, "client.py"))
 
         async def scenario():
-            async def handle(reader, writer):
-                try:
-                    line = await reader.readline()
-                    req = json.loads(line.decode("utf-8"))
-                    allowed = req.get("token") == "TESTTOKEN"
-                    resp = {"ok": allowed, "action": req.get("cmd")}
-                    if not allowed:
-                        resp["error"] = "令牌不匹配"
-                    elif req.get("cmd") == "ping":
-                        resp.update({"device": "MockPhone", "battery": 88})
-                    writer.write((json.dumps(resp) + "\n").encode("utf-8"))
-                    await writer.drain()
-                finally:
-                    writer.close()
-
-            server = await asyncio.start_server(handle, "127.0.0.1", 0)
+            shared = {"challenge": ""}
+            server = await asyncio.start_server(
+                lambda r, w: self._phone(r, w, "TESTTOKEN", shared), "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             async with server:
                 good = client_mod.YuiLockClient(
@@ -99,6 +126,29 @@ class TestClientProtocol(unittest.TestCase):
                     host="127.0.0.1", port=port, token="WRONG", transport="lan")
                 denied = await bad.lock_screen()
                 self.assertFalse(denied.get("ok"), denied)
+                self.assertIn("令牌", denied.get("error", ""))
+
+                noauth = client_mod.YuiLockClient(
+                    host="127.0.0.1", port=port, token="", transport="lan")
+                rejected = await noauth.lock_screen()
+                self.assertFalse(rejected.get("ok"), rejected)
+
+        asyncio.run(scenario())
+
+    def test_empty_token_phone_rejects(self):
+        client_mod = load_module("yuilock_client_test2", os.path.join(ROOT, "client.py"))
+
+        async def scenario():
+            shared = {"challenge": ""}
+            server = await asyncio.start_server(
+                lambda r, w: self._phone(r, w, "", shared), "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                c = client_mod.YuiLockClient(
+                    host="127.0.0.1", port=port, token="TESTTOKEN", transport="lan")
+                r = await c.lock_screen()
+                self.assertFalse(r.get("ok"), r)
+                self.assertIn("未设置令牌", r.get("error", ""))
 
         asyncio.run(scenario())
 
