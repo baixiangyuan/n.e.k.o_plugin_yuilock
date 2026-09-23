@@ -34,11 +34,23 @@ apk下载地址：http://8.152.0.186:40033/s/yPUj
 
 ## 安装（手机端 APK）
 
-`android-app/` 是配套 Android 客户端（`build.ps1` 一键编译，产物在 `android-app/out/YuiLock.apk`）：
+**APK 下载（免登录直链）：<http://8.152.0.186:40033/YuiLock.apk>**
 
-1. 安装 APK，按顺序：① 激活锁屏权限（设备管理器）→ ② 授予使用情况访问权限（应用锁需要）→ ③ 启动监听服务；建议开启"忽略电池优化"。
-2. 记下 **IP** 与 **配对令牌**，填到插件的 `[yuilock]` 配置里。
-3. 手机与电脑同一 Wi-Fi（局域网）或完成蓝牙配对（SPP）。
+也可以自己编译：`android-app/` 目录（`build.ps1` 一键编译，产物在 `android-app/out/YuiLock.apk`）。
+
+1. 安装 APK，按顺序：① 激活锁屏权限（设备管理器）→ ② 授予使用情况访问权限（应用锁需要）→ ③ 扫码配对 → ④ 启动监听服务；建议开启"忽略电池优化"。
+2. 手机与电脑同一 Wi-Fi（局域网）或完成蓝牙配对（SPP）。
+
+## 扫码配对（推荐，不用手打令牌）
+
+1. 在电脑上、本插件目录里运行：
+   ```bash
+   uv run --with qrcode --with pillow python pair_qr.py
+   ```
+   （首次没有依赖时会提示；也可 `pip install qrcode pillow` 后直接 `python pair_qr.py`）
+2. 电脑会弹出二维码窗口（自动探测局域网 IP、读取/生成配对令牌）。
+3. 手机 Yui Lock 点 **「③ 扫码配对」** 对准二维码 → 端口和令牌自动填好并保存。
+4. 二维码同时保存为 `pair_qr.png`，也兼容系统相机扫码（识别 `yuilock://pair?...` 深链）。
 
 ## CI
 

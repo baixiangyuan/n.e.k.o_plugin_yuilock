@@ -27,6 +27,8 @@ public class MainActivity extends Activity {
 
     private static final int PERMS_REQ = 10;
     private static final int ADMIN_REQ = 11;
+    private static final int SCAN_REQ = 12;
+    private static final int CAMERA_REQ = 20;
 
     private SharedPreferences prefs;
     private final Handler ui = new Handler();
@@ -54,6 +56,7 @@ public class MainActivity extends Activity {
         findViewById(R.id.btnAdmin).setOnClickListener(v -> askAdmin());
         findViewById(R.id.btnUsage).setOnClickListener(v ->
                 startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)));
+        findViewById(R.id.btnScan).setOnClickListener(v -> startScan());
         findViewById(R.id.btnStart).setOnClickListener(v -> {
             Intent i = new Intent(this, LockService.class);
             if (Build.VERSION.SDK_INT >= 26) {
@@ -87,8 +90,55 @@ public class MainActivity extends Activity {
                 && checkSelfPermission("android.permission.BLUETOOTH_CONNECT") != PackageManager.PERMISSION_GRANTED) {
             need.add("android.permission.BLUETOOTH_CONNECT");
         }
+        if (checkSelfPermission("android.permission.CAMERA") != PackageManager.PERMISSION_GRANTED) {
+            need.add("android.permission.CAMERA");
+        }
         if (!need.isEmpty()) {
             requestPermissions(need.toArray(new String[0]), PERMS_REQ);
+        }
+    }
+
+    private void startScan() {
+        if (checkSelfPermission("android.permission.CAMERA") == PackageManager.PERMISSION_GRANTED) {
+            startActivityForResult(new Intent(this, ScanActivity.class), SCAN_REQ);
+        } else {
+            requestPermissions(new String[]{"android.permission.CAMERA"}, CAMERA_REQ);
+        }
+    }
+
+    /** 解析 yuilock://pair?p=端口&t=令牌 并保存 */
+    private boolean applyPair(String text) {
+        try {
+            if (text == null) {
+                return false;
+            }
+            java.net.URI uri = java.net.URI.create(text.trim());
+            if (!"yuilock".equals(uri.getScheme()) || !"pair".equals(uri.getHost())) {
+                return false;
+            }
+            String query = uri.getRawQuery();
+            String port = null;
+            String token = null;
+            for (String kv : query.split("&")) {
+                String[] pair = kv.split("=", 2);
+                if (pair.length == 2) {
+                    if ("p".equals(pair[0])) port = pair[1];
+                    if ("t".equals(pair[0])) token = pair[1];
+                }
+            }
+            if (port == null || token == null || token.isEmpty()) {
+                return false;
+            }
+            int pv = Integer.parseInt(port);
+            if (pv < 1024 || pv > 65535) {
+                return false;
+            }
+            prefs.edit().putString("port", port).putString("token", token).apply();
+            ((EditText) findViewById(R.id.etPort)).setText(port);
+            ((EditText) findViewById(R.id.etToken)).setText(token);
+            return true;
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -194,10 +244,21 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == CAMERA_REQ && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startScan();
+        }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == SCAN_REQ && resultCode == RESULT_OK && data != null) {
+            if (applyPair(data.getStringExtra("text"))) {
+                Toast.makeText(this, "配对成功：端口和令牌已自动填好", Toast.LENGTH_LONG).show();
+            } else {
+                Toast.makeText(this, "二维码不是 Yui Lock 配对码", Toast.LENGTH_SHORT).show();
+            }
+        }
     }
 }

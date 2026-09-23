@@ -17,17 +17,21 @@ New-Item -ItemType Directory -Force $out | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 
 "==> aapt2 link"
-& "$bt\aapt2.exe" link -o "$out\base.apk" -I $aj --manifest "$root\AndroidManifest.xml" -R "$out\res.zip" --java "$out\gen" --min-sdk-version 26 --target-sdk-version 34 --version-code 1 --version-name 1.0.0 --auto-add-overlay
+& "$bt\aapt2.exe" link -o "$out\base.apk" -I $aj --manifest "$root\AndroidManifest.xml" -R "$out\res.zip" --java "$out\gen" --min-sdk-version 26 --target-sdk-version 34 --version-code 2 --version-name 1.1.0 --auto-add-overlay
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 
 "==> javac"
+$libs = @(Get-ChildItem "$root\libs" -Filter *.jar -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+$cp = $aj
+if ($libs.Count -gt 0) { $cp = "$aj;" + ($libs -join ";") }
 $srcs = @(Get-ChildItem "$root\src", "$out\gen" -Recurse -Filter *.java | ForEach-Object { $_.FullName })
-javac -nowarn -encoding UTF-8 -source 8 -target 8 -cp $aj -d "$out\classes" $srcs
+javac -nowarn -encoding UTF-8 -source 8 -target 8 -cp $cp -d "$out\classes" $srcs
 if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
 "==> d8"
-$classes = @(Get-ChildItem "$out\classes" -Recurse -Filter *.class | ForEach-Object { $_.FullName })
-& "$bt\d8.bat" --release --lib $aj --min-api 26 --output $out $classes
+$d8in = @(Get-ChildItem "$out\classes" -Recurse -Filter *.class | ForEach-Object { $_.FullName })
+if ($libs.Count -gt 0) { $d8in += $libs }
+& "$bt\d8.bat" --release --lib $aj --min-api 26 --output $out $d8in
 if ($LASTEXITCODE -ne 0) { throw "d8 failed" }
 
 "==> package"
