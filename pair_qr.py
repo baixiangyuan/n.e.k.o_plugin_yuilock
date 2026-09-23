@@ -12,11 +12,10 @@ host=auto 时自动探测本机局域网 IP；token 为空时随机生成一个�
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import secrets
 import socket
 import sys
-from pathlib import Path
-
 import tomllib
 
 ROOT = Path(__file__).resolve().parent

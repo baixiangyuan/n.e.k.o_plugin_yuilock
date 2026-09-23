@@ -34,7 +34,7 @@ apk下载地址：http://8.152.0.186:40033/s/yPUj
 
 ## 安装（手机端 APK）
 
-**APK 下载（免登录直链）：<http://8.152.0.186:40033/YuiLock.apk>**
+**APK 下载（分享直链）：<http://8.152.0.186:40033/s/yPUj>**
 
 也可以自己编译：`android-app/` 目录（`build.ps1` 一键编译，产物在 `android-app/out/YuiLock.apk`）。
 
