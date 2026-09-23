@@ -243,6 +243,9 @@ class YuiLockPlugin(NekoPluginBase):
                      f"锁屏权限{'有' if p.get('admin') else '未激活'}，"
                      f"应用锁{'开' if p.get('applock') else '关'}）{token_note}；"
                      f"电脑锁：{'开' if pc else '关'}")
+                note = str(p.get("applock_note") or "")
+                if note:
+                    s += f"\n手机备注：{note}"
             else:
                 s = f"手机：不在线（{(p or {}).get('error', '无响应')}）；电脑锁：{'开' if pc else '关'}"
             # phone_online 单独成字段：面板只根据它上色，RPC 成功 ≠ 手机在线

@@ -61,7 +61,7 @@ uv run --with qrcode --with pillow python web_panel.py
 
 > ⚠ v1.4.0 起签名密钥已轮换，与旧版本签名不同，需要**卸载旧版后重装**。
 > 正式渠道优先 GitHub Releases；HTTP 网盘为便利分发，安装前建议核对：
-> - APK SHA256：`0210982BE5941B837823CC815E50931CFAA72FB8D4D678328C9B335B03675DD3`
+> - APK SHA256：`11DC4161BF5B86EB0594C4F926E1D4F97D0763C09A8C2DE031395621DEB327D6`
 > - 证书指纹（SHA-256）：`AF:9A:80:E6:F8:01:65:E7:4F:EC:F5:73:20:36:F6:E7:C2:B5:AA:C1:B0:1C:C9:3B:84:D2:24:B1:49:3D:36:21`
 
 也可以自己编译：`android-app/` 目录（`build.ps1` 一键编译，产物在 `android-app/out/YuiLock.apk`）。

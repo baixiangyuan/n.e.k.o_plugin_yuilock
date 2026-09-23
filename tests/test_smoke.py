@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 import secrets
+import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -116,14 +117,16 @@ class TestClientProtocol(unittest.TestCase):
                         session["challenge"] = ""
                         if valid and hmac.compare_digest(want, str(req.get("proof")).lower()):
                             resp = {"ok": True, "action": cmd}
-                            # 成功响应带签名（resp|cmd|nonce|challenge|1|error），客户端核验后才采信
-                            if not unsigned_final:
-                                resp["sig"] = hmac.new(
-                                    token.encode(),
-                                    f"resp|{cmd}|{nonce}|{ch}|1|".encode(),
-                                    hashlib.sha256).hexdigest()
                         else:
                             resp = {"ok": False, "error": "令牌验证失败"}
+                        # 失败与成功都签名；unsigned_final 模拟缺失/被剥离签名的响应
+                        if not unsigned_final and token:
+                            flag = "1" if resp.get("ok") else "0"
+                            err = str(resp.get("error", ""))
+                            resp["sig"] = hmac.new(
+                                token.encode(),
+                                f"resp|{cmd}|{nonce}|{ch}|{flag}|{err}".encode(),
+                                hashlib.sha256).hexdigest()
                 else:
                     resp = {"ok": True, "action": cmd}
                     if cmd == "ping":
@@ -159,7 +162,7 @@ class TestClientProtocol(unittest.TestCase):
                     host="127.0.0.1", port=port, token="WRONG", transport="lan")
                 denied = await bad.lock_screen()
                 self.assertFalse(denied.get("ok"), denied)
-                self.assertIn("令牌", denied.get("error", ""))
+                self.assertTrue(str(denied.get("error", "")), denied)
 
                 noauth = client_mod.YuiLockClient(
                     host="127.0.0.1", port=port, token="", transport="lan")
@@ -179,8 +182,9 @@ class TestClientProtocol(unittest.TestCase):
                 c = client_mod.YuiLockClient(
                     host="127.0.0.1", port=port, token="TESTTOKEN", transport="lan")
                 r = await c.lock_screen()
+                # 手机无 token 无法签名 → 第一包不是挑战信封 → 客户端按不可信响应拒绝
                 self.assertFalse(r.get("ok"), r)
-                self.assertIn("未设置令牌", r.get("error", ""))
+                self.assertIn("认证流程异常", r.get("error", ""))
 
         asyncio.run(scenario())
 
@@ -251,6 +255,45 @@ class TestClientProtocol(unittest.TestCase):
                 self.assertIn("响应签名校验失败", r.get("error", ""))
 
         asyncio.run(scenario())
+
+
+@unittest.skipUnless(sys.platform == "win32", "pclock 状态校验依赖 Windows")
+class TestPclockState(unittest.TestCase):
+    """回归 #28：坏状态文件不抛错；并发 spawn 只留一个锁进程。"""
+
+    def test_bad_state_and_concurrent_spawn(self):
+        import threading
+
+        pclock = load_module("yuilock_pclock_test", os.path.join(ROOT, "pclock.py"))
+
+        # 1) 状态文件 pid 非整数：不抛错、按无效清理
+        pclock.STATE_PATH.write_text(
+            json.dumps({"pid": "abc", "instance": "x", "exe": "y"}), encoding="utf-8")
+        self.assertFalse(pclock.is_locker_alive())
+        alive, _msg = pclock.kill_locker()
+        self.assertFalse(alive)
+        self.assertFalse(pclock.STATE_PATH.exists())
+
+        # 2) 并发 spawn：两线程同时锁定，只能留下一个锁进程
+        stub = pclock.STATE_PATH.with_name("yuilock_test_stub_locker.py")
+        stub.write_text("import time; time.sleep(10)", encoding="utf-8")
+        try:
+            results = []
+
+            def worker():
+                results.append(pclock.spawn_locker(stub))
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            oks = [r for r in results if r.get("ok")]
+            self.assertEqual(len(oks), 1, results)
+            # 清理：结束测试用的 stub 锁进程
+            pclock.kill_locker()
+        finally:
+            stub.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

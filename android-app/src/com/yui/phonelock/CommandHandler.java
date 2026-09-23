@@ -71,6 +71,9 @@ public final class CommandHandler {
         boolean setAppLock(boolean on);
 
         int battery();
+
+        /** 最近事件（含失败原因），随 ping 返回给电脑端展示 */
+        String appLockNote();
     }
 
     private CommandHandler() {
@@ -110,20 +113,21 @@ public final class CommandHandler {
             if (!constantTimeEquals(want, proof)) {
                 return fail("令牌验证失败");
             }
-            // 执行；成功的最终响应带 HMAC 签名（覆盖 challenge/命令/nonce/结果），
-            // 客户端核对通过才采信，防中间人篡改结果伪造成功。
+            // 执行；最终响应（成功与失败都算）带 HMAC 签名（覆盖 challenge/命令/nonce/结果），
+            // 客户端核对通过才采信，防中间人把成功改成失败或把失败改成成功。
             JSONObject resp;
             switch (cmd) {
                 case "lock":
                     if (!h.isAdminActive()) {
-                        return fail("手机未激活设备管理器，请先在 Yui Lock 应用里完成第①步");
+                        resp = failJson("手机未激活设备管理器，请先在 Yui Lock 应用里完成第①步");
+                        break;
                     }
                     h.lockScreen();
                     resp = okJson("lock");
                     break;
                 case "applock":
                     resp = h.setAppLock(true) ? okJson("applock")
-                            : failJson("开启失败：请先在应用里授予“使用情况访问权限”");
+                            : failJson("开启失败：请先授予「使用情况访问权限」和「显示悬浮窗」权限");
                     break;
                 case "unlock":
                     h.setAppLock(false);
@@ -151,6 +155,7 @@ public final class CommandHandler {
             o.put("applock", h.isAppLockOn());
             o.put("battery", h.battery());
             o.put("token_set", h.token() != null && !h.token().isEmpty());
+            o.put("applock_note", h.appLockNote() == null ? "" : h.appLockNote());
             return o.toString();
         } catch (Exception e) {
             return "{\"ok\":false}";

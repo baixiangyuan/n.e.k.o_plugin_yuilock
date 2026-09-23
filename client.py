@@ -86,11 +86,16 @@ class YuiLockClient:
             if not line1:
                 raise RuntimeError("手机无响应")
             r1 = json.loads(line1.decode("utf-8"))
-            if payload.get("cmd") in CONTROL_CMDS and r1.get("ok") and not r1.get("auth"):
-                # 控制命令必须走挑战-应答；对方不要求验证 = 可能遭劫持/伪造
-                return {"ok": False,
-                        "error": "认证流程异常：对端未要求配对验证，已拒绝执行"}
-            if r1.get("auth") == "hmac-sha256" and r1.get("challenge"):
+            if payload.get("cmd") in CONTROL_CMDS:
+                # 控制命令的第一包必须是对称挑战信封：直接 ok=true 是伪造；
+                # 未签名的失败也不采信（防中间人把结果改写成失败）
+                is_envelope = r1.get("auth") == "hmac-sha256" and r1.get("challenge")
+                if r1.get("ok") and not r1.get("auth"):
+                    return {"ok": False,
+                            "error": "认证流程异常：对端未要求配对验证，已拒绝执行"}
+                if not is_envelope:
+                    return {"ok": False,
+                            "error": "认证流程异常：对端未返回配对挑战，响应不可信（可能遭篡改或配置不匹配）"}
                 proof = _auth_proof(self.token, str(payload.get("cmd")),
                                     str(payload.get("nonce")), str(r1["challenge"]))
                 writer.write((json.dumps(dict(payload, proof=proof)) + "\n").encode("utf-8"))
@@ -99,7 +104,8 @@ class YuiLockClient:
                 if not line2:
                     raise RuntimeError("手机无响应")
                 r2 = json.loads(line2.decode("utf-8"))
-                if r2.get("ok") and not self._verify_resp(r2, payload, str(r1["challenge"])):
+                # 失败与成功同样验签：防把已签的成功改写成失败
+                if not self._verify_resp(r2, payload, str(r1["challenge"])):
                     return {"ok": False,
                             "error": "响应签名校验失败，结果不可信（可能遭篡改）"}
                 return r2
@@ -159,14 +165,19 @@ class YuiLockClient:
 
         try:
             r1 = await send_recv(payload)
-            if payload.get("cmd") in CONTROL_CMDS and r1.get("ok") and not r1.get("auth"):
-                return {"ok": False,
-                        "error": "认证流程异常：对端未要求配对验证，已拒绝执行"}
-            if r1.get("auth") == "hmac-sha256" and r1.get("challenge"):
+            if payload.get("cmd") in CONTROL_CMDS:
+                is_envelope = r1.get("auth") == "hmac-sha256" and r1.get("challenge")
+                if r1.get("ok") and not r1.get("auth"):
+                    return {"ok": False,
+                            "error": "认证流程异常：对端未要求配对验证，已拒绝执行"}
+                if not is_envelope:
+                    return {"ok": False,
+                            "error": "认证流程异常：对端未返回配对挑战，响应不可信（可能遭篡改或配置不匹配）"}
                 proof = _auth_proof(self.token, str(payload.get("cmd")),
                                     str(payload.get("nonce")), str(r1["challenge"]))
                 r2 = await send_recv(dict(payload, proof=proof))
-                if r2.get("ok") and not self._verify_resp(r2, payload, str(r1["challenge"])):
+                # 失败与成功同样验签：防把已签的成功改写成失败
+                if not self._verify_resp(r2, payload, str(r1["challenge"])):
                     return {"ok": False,
                             "error": "响应签名校验失败，结果不可信（可能遭篡改）"}
                 return r2

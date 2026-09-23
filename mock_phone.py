@@ -51,12 +51,16 @@ async def handle(reader, writer):
                     session["challenge"] = ""
                     if valid and hmac.compare_digest(want, str(req.get("proof")).lower()):
                         resp = {"ok": True, "action": cmd}
-                        # 成功的最终响应带签名（resp|cmd|nonce|challenge|ok|error），客户端核验后才采信
-                        resp["sig"] = hmac.new(
-                            TOKEN.encode(), f"resp|{cmd}|{nonce}|{ch}|1|".encode(),
-                            hashlib.sha256).hexdigest()
                     else:
                         resp = {"ok": False, "error": "令牌验证失败"}
+                    if TOKEN:
+                        # 失败与成功都签名（resp|cmd|nonce|challenge|ok|error），客户端全量核验
+                        flag = "1" if resp.get("ok") else "0"
+                        err = str(resp.get("error", ""))
+                        resp["sig"] = hmac.new(
+                            TOKEN.encode(),
+                            f"resp|{cmd}|{nonce}|{ch}|{flag}|{err}".encode(),
+                            hashlib.sha256).hexdigest()
             else:
                 resp = {"ok": True, "action": cmd}
                 if cmd == "ping":

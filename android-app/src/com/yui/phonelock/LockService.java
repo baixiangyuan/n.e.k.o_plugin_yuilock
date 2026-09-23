@@ -431,11 +431,15 @@ public class LockService extends Service implements CommandHandler.Host {
         }
     }
 
-    /** 权限预检通过才写状态并启动拦截线程；关闭永远成功 */
+    /** 权限预检（使用情况访问 + 悬浮窗）通过才写状态并启动拦截线程；关闭永远成功 */
     public synchronized boolean setAppLock(boolean on) {
         if (on) {
             if (!hasUsageAccess()) {
-                lastEvent = "应用锁：缺少“使用情况访问权限”，未开启";
+                lastEvent = "应用锁开启失败：缺少「使用情况访问权限」";
+                return false;
+            }
+            if (!Settings.canDrawOverlays(this)) {
+                lastEvent = "应用锁开启失败：缺少「显示悬浮窗」权限（Android 10+ 拦截必需）";
                 return false;
             }
             prefs.edit().putBoolean("applock_active", true).apply();
@@ -464,29 +468,48 @@ public class LockService extends Service implements CommandHandler.Host {
             appLockRunning = true;
             return;
         }
+        if (!Settings.canDrawOverlays(this)) {
+            // 悬浮窗权限是 Android 10+ 后台拉起桌面的前提：缺失时干脆不进入「开启」状态
+            prefs.edit().putBoolean("applock_active", false).apply();
+            appLockRunning = false;
+            lastEvent = "应用锁：缺少「显示悬浮窗」权限，未开启";
+            return;
+        }
         appLockThread = new Thread(() -> {
             appLockRunning = true;
             UsageStatsManager usm = (UsageStatsManager) getSystemService(USAGE_STATS_SERVICE);
             try {
-                if (!Settings.canDrawOverlays(this)) {
-                    lastEvent = "应用锁：建议授予「显示悬浮窗」权限（Android 10+ 后台拉起桌面需要）";
-                }
+                int failStreak = 0;
                 while (running && prefs.getBoolean("applock_active", false)) {
                     try {
-                        String top = queryTop(usm);
-                        if (top != null && !whitelist.contains(top)) {
-                            Intent home = new Intent(Intent.ACTION_MAIN)
-                                    .addCategory(Intent.CATEGORY_HOME)
-                                    .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                            startActivity(home);
-                            Thread.sleep(400);
-                            // 后台拉起可能被系统静默拒绝（Android 10+）：核验是否真的回到桌面
-                            String nowTop = queryTop(usm);
-                            if (top.equals(nowTop)) {
-                                lastEvent = "应用锁拦截失败：请在系统设置授予本应用「显示悬浮窗」权限";
-                            } else {
-                                lastEvent = "应用锁拦截: " + top;
+                        // 悬浮窗权限被中途收回也视为失败
+                        if (!Settings.canDrawOverlays(this)) {
+                            failStreak++;
+                        } else {
+                            String top = queryTop(usm);
+                            if (top != null && !whitelist.contains(top)) {
+                                Intent home = new Intent(Intent.ACTION_MAIN)
+                                        .addCategory(Intent.CATEGORY_HOME)
+                                        .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                startActivity(home);
+                                Thread.sleep(400);
+                                // 后台拉起可能被系统静默拒绝（Android 10+）：核验是否真的回到桌面
+                                String nowTop = queryTop(usm);
+                                if (top.equals(nowTop)) {
+                                    failStreak++;
+                                    lastEvent = "应用锁拦截失败：请在系统设置授予本应用「显示悬浮窗」权限";
+                                } else {
+                                    failStreak = 0;
+                                    lastEvent = "应用锁拦截: " + top;
+                                }
                             }
+                        }
+                        if (failStreak >= 5) {
+                            // 连续失败：不再保持「开启」状态，避免电脑端看到假开启
+                            prefs.edit().putBoolean("applock_active", false).apply();
+                            appLockRunning = false;
+                            lastEvent = "应用锁已自动关闭：连续拦截失败（请授予「显示悬浮窗」权限后重试）";
+                            return;
                         }
                         Thread.sleep(300);
                     } catch (InterruptedException ie) {
@@ -504,6 +527,10 @@ public class LockService extends Service implements CommandHandler.Host {
             }
         }, "yuilock-applock");
         appLockThread.start();
+    }
+
+    public String appLockNote() {
+        return lastEvent;
     }
 
     private String queryTop(UsageStatsManager usm) {

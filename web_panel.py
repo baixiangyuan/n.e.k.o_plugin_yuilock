@@ -183,6 +183,9 @@ class Handler(BaseHTTPRequestHandler):
                 phone = (f"在线 · {p.get('device', '?')} · 电量 {p.get('battery', '?')}% · "
                          f"应用锁 {'开' if p.get('applock') else '关'} · "
                          f"锁屏权限 {'有' if p.get('admin') else '未激活'}")
+                note = str(p.get("applock_note") or "")
+                if note:
+                    phone += f"\n手机备注：{note}"
                 if not p.get("token_set"):
                     phone += "\n⚠ 手机未设令牌：控制命令会被拒绝，请在 plugin.toml 配置 token"
             else:

@@ -51,7 +51,8 @@ WHITELIST_BASE = {
 
 
 def norm_name(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    # 保留点号：只小写、折叠空白（系统外壳比对已改用完整路径，此函数仅作常规小写化备用）
+    return re.sub(r"\s+", "", (s or "").lower())
 
 
 ARGS = argparse.ArgumentParser()
@@ -63,8 +64,40 @@ OPTS = ARGS.parse_args()
 
 SELF_PATH = os.path.abspath(sys.executable).lower()
 ALLOW_PATHS = {os.path.abspath(p).lower() for p in OPTS.allow}
-# 系统外壳只认系统目录下的完整路径（防止把同名 exe 放别处绕过）
-SYSTEM_ROOT = os.path.join(os.environ.get("SystemRoot", r"C:\Windows").lower(), "")
+# 系统外壳白名单：只认「完整路径」，保留扩展名与点号，不做任何名字折叠
+SYSTEM_ROOT = os.environ.get("SystemRoot", r"C:\Windows").lower()
+SHELL_ROOT_FILES = {"explorer.exe"}
+SHELL_SYSTEM32_FILES = {"runtimebroker.exe"}
+SHELL_SYSTEMAPP_PACKAGES = (
+    "microsoft.windows.search_",
+    "microsoft.windows.startmenuexperiencehost_",
+    "microsoft.windows.shellexperiencehost_",
+    "microsoftwindows.client.cbs_",
+    "microsoft.lockapp_",
+)
+SHELL_SYSTEMAPP_STEMS = {"searchhost", "startmenuexperiencehost",
+                         "shellexperiencehost", "textinputhost", "lockapp"}
+
+
+def is_shell_path(lp: str) -> bool:
+    """仅放行 %SystemRoot% 下固定位置的系统外壳（完整路径精确匹配）。"""
+    root_prefix = SYSTEM_ROOT + "\\"
+    if not lp.startswith(root_prefix):
+        return False
+    rel = lp[len(root_prefix):]
+    directory, name = os.path.split(rel)
+    name = name.lower()
+    if directory == "" and name in SHELL_ROOT_FILES:
+        return True
+    if directory in ("system32", "syswow64") and name in SHELL_SYSTEM32_FILES:
+        return True
+    # SystemApps 的固定包前缀目录（目录名带版本哈希，前缀固定），文件主名保留点号比对
+    if directory.startswith("systemapps\\") and "\\" not in directory[len("systemapps\\"):]:
+        pkg = directory[len("systemapps\\"):]
+        if any(pkg.startswith(pfx) for pfx in SHELL_SYSTEMAPP_PACKAGES):
+            stem = os.path.splitext(name)[0].lower()
+            return stem in SHELL_SYSTEMAPP_STEMS
+    return False
 
 
 def exe_path(pid: int) -> str:
@@ -89,14 +122,11 @@ def allowed_pid(pid: int) -> bool:
     if not path:
         return False
     lp = path.lower()
-    # 系统外壳：主名匹配 + 必须位于 %SystemRoot% 下（完整路径，防改名/挪位置绕过）
-    name = norm_name(os.path.splitext(os.path.basename(path))[0])
-    if name in WHITELIST_BASE and lp.startswith(SYSTEM_ROOT):
-        return True
     # 显式 exe 路径列表（不信任整个目录）
     if lp == SELF_PATH or lp in ALLOW_PATHS:
         return True
-    return False
+    # 系统外壳：只放行 %SystemRoot% 下固定位置的完整路径（SystemApps 包前缀 + 主名白名单）
+    return is_shell_path(lp)
 
 
 def write_state() -> None:
