@@ -1,6 +1,6 @@
 # Yui 手机/电脑锁（N.E.K.O. Plugin）
 
-apk下载地址：http://8.152.0.186:40033/s/53tE
+apk下载地址：http://8.152.0.186:40033/s/k5C5
 
 让 Yui 可以惩罚主人：
 
@@ -57,7 +57,7 @@ uv run --with qrcode --with pillow python web_panel.py
 
 ## 安装（手机端 APK）
 
-**APK 下载（分享直链）：<http://8.152.0.186:40033/s/53tE>**
+**APK 下载（分享直链）：<http://8.152.0.186:40033/s/k5C5>**
 
 > ⚠ v1.4.0 起签名密钥已轮换，与旧版本签名不同，需要**卸载旧版后重装**。
 > 正式渠道优先 GitHub Releases；HTTP 网盘为便利分发，安装前建议核对：
