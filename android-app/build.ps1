@@ -1,13 +1,53 @@
-# YuiLock APK 构建脚本（aapt2 + javac + d8 + zipalign + apksigner，无 Gradle）
+﻿# YuiLock APK 构建脚本（aapt2 + javac + d8 + zipalign + apksigner，无 Gradle）
+# 自动探测 SDK/JDK（环境变量 → 常见路径 → 本机 E:\dev），签名密钥从仓库外读取：
+#   $env:YUILOCK_KS_PATH / $env:YUILOCK_KS_PASS，或 <repo 同级>\keystore-backup\yuilock.keystore(.password)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$tools = "$env:USERPROFILE\android-tools"
-$sdk = "$tools\sdk"; $jdk = "$tools\jdk"
+$out = "$root\out"
+
+function Find-Tool([string[]]$candidates, [string]$probe) {
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path (Join-Path $c $probe))) { return $c }
+    }
+    return $null
+}
+
+# ---------- SDK ----------
+$sdkCandidates = @(
+    $env:ANDROID_SDK_ROOT, $env:ANDROID_HOME,
+    "$env:USERPROFILE\android-tools\sdk",
+    "E:\dev\android-sdk"
+)
+$sdk = Find-Tool $sdkCandidates "platform-tools\adb.exe"
+if (-not $sdk) { throw "找不到 Android SDK（设置 ANDROID_SDK_ROOT 或放到 E:\dev\android-sdk）" }
+
+# ---------- JDK ----------
+$jdkCandidates = @($env:JAVA_HOME, "$env:USERPROFILE\android-tools\jdk", "E:\dev\jdk-17")
+$jdk = Find-Tool $jdkCandidates "bin\javac.exe"
+if (-not $jdk) { throw "找不到 JDK（设置 JAVA_HOME 或放到 E:\dev\jdk-17）" }
 $env:JAVA_HOME = $jdk
 $env:Path = "$jdk\bin;$env:Path"
-$bt = "$sdk\build-tools\34.0.0"
-$aj = "$sdk\platforms\android-34\android.jar"
-$out = "$root\out"
+
+# ---------- build-tools（优先 34.0.0，否则取最高版本）----------
+$btDir = "$sdk\build-tools"
+$btVer = (Get-ChildItem $btDir -Directory | Sort-Object { [version]$_.Name } -Descending |
+    Where-Object { Test-Path "$($_.FullName)\aapt2.exe" } | Select-Object -First 1).Name
+if (-not $btVer) { throw "build-tools 下找不到 aapt2" }
+$bt = "$btDir\$btVer"
+
+# ---------- platform（优先 android-34，否则取最高）----------
+$platDir = "$sdk\platforms"
+$platNames = @(Get-ChildItem $platDir -Directory |
+    Where-Object { Test-Path "$($_.FullName)\android.jar" } | Select-Object -ExpandProperty Name)
+if ($platNames -contains 'android-34') {
+    $plat = 'android-34'
+} else {
+    $plat = $platNames | Sort-Object { [version](($_ -replace '^android-', '') + '.0') } -Descending | Select-Object -First 1
+}
+if (-not $plat) { throw "platforms 下找不到 android.jar" }
+$aj = "$platDir\$plat\android.jar"
+
+"==> tools: sdk=$sdk build-tools=$btVer platform=$plat jdk=$jdk"
 
 if (Test-Path $out) { Remove-Item $out -Recurse -Force -Confirm:$false }
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -17,7 +57,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 
 "==> aapt2 link"
-& "$bt\aapt2.exe" link -o "$out\base.apk" -I $aj --manifest "$root\AndroidManifest.xml" -R "$out\res.zip" --java "$out\gen" --min-sdk-version 26 --target-sdk-version 34 --version-code 6 --version-name 1.6.0 --auto-add-overlay
+& "$bt\aapt2.exe" link -o "$out\base.apk" -I $aj --manifest "$root\AndroidManifest.xml" -R "$out\res.zip" --java "$out\gen" --min-sdk-version 26 --target-sdk-version 34 --version-code 7 --version-name 1.6.1 --auto-add-overlay
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 
 "==> javac"
@@ -41,24 +81,28 @@ if ($LASTEXITCODE -ne 0) { throw "jar failed" }
 if ($LASTEXITCODE -ne 0) { throw "zipalign failed" }
 
 "==> sign"
-# 签名口令不写入仓库：优先读环境变量 YUILOCK_KS_PASS，其次 android-app\keystore.password（已 gitignore），都没有则随机生成并落盘
+# 签名密钥不入仓库：优先环境变量，其次 repo 同级 keystore-backup\，最后旧的仓库内路径（兼容）
+$ksCandidates = @()
+if ($env:YUILOCK_KS_PATH) { $ksCandidates += $env:YUILOCK_KS_PATH }
+$ksCandidates += @(
+    "$root\yuilock.keystore",                      # 旧布局（仓库内，已 gitignore）
+    "$root\..\..\keystore-backup\yuilock.keystore" # repo 外 keystore-backup\（推荐）
+)
+$ks = $null
+foreach ($c in $ksCandidates) { if ($c -and (Test-Path $c)) { $ks = (Resolve-Path $c).Path; break } }
+if (-not $ks) { throw "找不到 yuilock.keystore（设置 YUILOCK_KS_PATH 或放到 repo 同级 keystore-backup\）" }
+
 $ksPass = $env:YUILOCK_KS_PASS
-$ksPassFile = "$root\keystore.password"
 if (-not $ksPass) {
-  if (Test-Path $ksPassFile) { $ksPass = (Get-Content $ksPassFile -Raw).Trim() }
+    $pwCandidates = @(
+        "$root\..\..\keystore-backup\yuilock.keystore.password",
+        "$root\keystore.password"
+    )
+    foreach ($c in $pwCandidates) { if ($c -and (Test-Path $c)) { $ksPass = (Get-Content $c -Raw).Trim(); break } }
 }
-if (-not $ksPass) {
-  $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
-  $bytes = New-Object byte[] 24
-  $rng.GetBytes($bytes)
-  $ksPass = ([Convert]::ToBase64String($bytes) -replace "\+", "a" -replace "/", "b")
-  Set-Content -Path $ksPassFile -Value $ksPass -Encoding ascii
-  "generated keystore password -> $ksPassFile (gitignored, 请勿提交)"
-}
-if (-not (Test-Path "$root\yuilock.keystore")) {
-  keytool -genkeypair -keystore "$root\yuilock.keystore" -alias yuilock -keyalg RSA -keysize 2048 -validity 10000 -storepass $ksPass -keypass $ksPass -dname "CN=YuiLock" | Out-Null
-}
-& "$bt\apksigner.bat" sign --ks "$root\yuilock.keystore" --ks-pass "pass:$ksPass" --key-pass "pass:$ksPass" --out "$out\YuiLock.apk" "$out\aligned.apk"
+if (-not $ksPass) { throw "找不到 keystore 口令（设置 YUILOCK_KS_PASS 或放 keystore.password 于 keystore-backup\）" }
+
+& "$bt\apksigner.bat" sign --ks $ks --ks-pass "pass:$ksPass" --key-pass "pass:$ksPass" --out "$out\YuiLock.apk" "$out\aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw "apksigner failed" }
 & "$bt\apksigner.bat" verify "$out\YuiLock.apk"
 if ($LASTEXITCODE -ne 0) { throw "apksigner verify failed" }
@@ -67,6 +111,6 @@ if ($LASTEXITCODE -ne 0) { throw "apksigner verify failed" }
 "APK SHA256:"
 (Get-FileHash -Algorithm SHA256 "$out\YuiLock.apk").Hash
 "证书指纹 (SHA-256):"
-keytool -list -v -alias yuilock -keystore "$root\yuilock.keystore" -storepass $ksPass 2>$null | Select-String "SHA256:" | ForEach-Object { $_.Line.Trim() }
+keytool -list -v -alias yuilock -keystore $ks -storepass $ksPass 2>$null | Select-String "SHA256:" | ForEach-Object { $_.Line.Trim() }
 
 "BUILD OK => $out\YuiLock.apk"

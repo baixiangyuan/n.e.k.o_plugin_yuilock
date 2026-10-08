@@ -14,6 +14,7 @@
     <string name="btn_stop">停止监听服务</string>
     <string name="btn_test">测试锁屏</string>
     <string name="btn_battery">忽略电池优化（保持后台常驻）</string>
+    <string name="btn_keep_alive">后台运行设置（防止被系统冻结）</string>
     <string name="admin_desc">允许 Yui 在电脑端触发锁屏。仅申请“锁定屏幕”一项权限，不会影响其他功能。</string>
     <string name="help_text">使用方法：\n1. 手机和电脑连同一个 Wi-Fi（或蓝牙配对）。\n2. 完成上面 ①②③④ 四步。\n3. 电脑端运行 pair_qr.py 显示二维码，手机点「扫码配对」自动填好令牌。\n4. 之后 Yui 生气时就能锁你的手机屏幕，或开启应用锁：打开任何 App 都会被立刻弹回桌面，重启手机即解除，也可以由 Yui 解锁。</string>
 </resources>

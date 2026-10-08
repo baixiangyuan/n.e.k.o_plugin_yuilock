@@ -22,6 +22,7 @@ import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.provider.Settings;
 
 import org.json.JSONObject;
@@ -87,6 +88,8 @@ public class LockService extends Service implements CommandHandler.Host {
             new java.util.concurrent.ArrayBlockingQueue<>(POOL_QUEUE_CAPACITY),
             new ThreadPoolExecutor.AbortPolicy());
     private WifiManager.MulticastLock multicastLock;
+    private WifiManager.WifiLock wifiLock;
+    private PowerManager.WakeLock wakeLock;
     private DevicePolicyManager dpm;
     private ComponentName admin;
     private SharedPreferences prefs;
@@ -181,6 +184,25 @@ public class LockService extends Service implements CommandHandler.Host {
                 multicastLock = wm.createMulticastLock("yuilock");
                 multicastLock.setReferenceCounted(false);
                 multicastLock.acquire();
+                // 标准保活：WifiLock 防止息屏后 Wi-Fi 休眠导致收不到命令（对全部机型通用）
+                try {
+                    wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "yuilock");
+                    wifiLock.setReferenceCounted(false);
+                    wifiLock.acquire();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        // 标准保活：持有 PARTIAL_WAKE_LOCK，避免 CPU 深度休眠错过网络请求（对全部机型通用）
+        if (wakeLock == null) {
+            try {
+                PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                if (pm != null) {
+                    wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "yuilock:listen");
+                    wakeLock.setReferenceCounted(false);
+                    wakeLock.acquire();
+                }
+            } catch (Throwable ignored) {
             }
         }
         Thread tcp = new Thread(() -> {
@@ -582,6 +604,20 @@ public class LockService extends Service implements CommandHandler.Host {
             } catch (Throwable ignored) {
             }
             multicastLock = null;
+        }
+        if (wifiLock != null) {
+            try {
+                wifiLock.release();
+            } catch (Throwable ignored) {
+            }
+            wifiLock = null;
+        }
+        if (wakeLock != null) {
+            try {
+                wakeLock.release();
+            } catch (Throwable ignored) {
+            }
+            wakeLock = null;
         }
         pool.shutdownNow();
         super.onDestroy();

@@ -257,6 +257,90 @@ class TestClientProtocol(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class TestDiscovery(unittest.TestCase):
+    """回归：discover() 必须用非连接 UDP socket 收广播应答。
+
+    历史 bug：用 remote_addr=("255.255.255.255", port) 的 connected socket，
+    Windows/Linux 会丢弃源地址不匹配（手机真实 IP）的回包 → 所有设备都发现不了。
+    """
+
+    def test_broadcast_targets_include_limited(self):
+        client_mod = load_module("yuilock_client_disco_targets", os.path.join(ROOT, "client.py"))
+        targets = client_mod.YuiLockClient._broadcast_targets()
+        self.assertIn("255.255.255.255", targets)
+        self.assertTrue(all(isinstance(t, str) and "." in t for t in targets), targets)
+
+    def test_discover_roundtrip(self):
+        client_mod = load_module("yuilock_client_disco", os.path.join(ROOT, "client.py"))
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            token = "TESTTOKEN"
+
+            class MockPhone(asyncio.DatagramProtocol):
+                def connection_made(self, transport):
+                    self.transport = transport
+
+                def datagram_received(self, data, addr):
+                    try:
+                        m = json.loads(data.decode("utf-8"))
+                    except Exception:
+                        return
+                    if not m.get("yui_lock_discover"):
+                        return
+                    nonce = str(m.get("n", ""))
+                    sig = hmac.new(token.encode("utf-8"),
+                                   ("discover|" + nonce).encode("utf-8"),
+                                   hashlib.sha256).hexdigest()
+                    reply = {"yui_lock_service": True, "n": nonce, "sig": sig}
+                    self.transport.sendto(json.dumps(reply).encode("utf-8"), addr)
+
+            transport, _ = await loop.create_datagram_endpoint(
+                MockPhone, local_addr=("0.0.0.0", 0), allow_broadcast=True)
+            try:
+                port = transport.get_extra_info("socket").getsockname()[1]
+                c = client_mod.YuiLockClient(host="auto", port=port, token=token)
+                return await c.discover(timeout=5.0)
+            finally:
+                transport.close()
+                await asyncio.sleep(0.05)
+
+        r = asyncio.run(scenario())
+        self.assertTrue(r, "discover() 未收到广播应答（connected-socket 回归？）")
+
+    def test_discover_rejects_bad_sig(self):
+        client_mod = load_module("yuilock_client_disco_badsig", os.path.join(ROOT, "client.py"))
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+
+            class MockPhone(asyncio.DatagramProtocol):
+                def connection_made(self, transport):
+                    self.transport = transport
+
+                def datagram_received(self, data, addr):
+                    m = json.loads(data.decode("utf-8"))
+                    if not m.get("yui_lock_discover"):
+                        return
+                    # nonce 回显正确，但签名是错的 → 客户端必须不采信
+                    reply = {"yui_lock_service": True, "n": str(m.get("n", "")),
+                             "sig": "f" * 64}
+                    self.transport.sendto(json.dumps(reply).encode("utf-8"), addr)
+
+            transport, _ = await loop.create_datagram_endpoint(
+                MockPhone, local_addr=("0.0.0.0", 0), allow_broadcast=True)
+            try:
+                port = transport.get_extra_info("socket").getsockname()[1]
+                c = client_mod.YuiLockClient(host="auto", port=port, token="TESTTOKEN")
+                return await c.discover(timeout=1.5)
+            finally:
+                transport.close()
+                await asyncio.sleep(0.05)
+
+        r = asyncio.run(scenario())
+        self.assertFalse(r, "签名错误的发现应答不应被采信")
+
+
 @unittest.skipUnless(sys.platform == "win32", "pclock 状态校验依赖 Windows")
 class TestPclockState(unittest.TestCase):
     """回归 #28：坏状态文件不抛错；并发 spawn 只留一个锁进程。"""

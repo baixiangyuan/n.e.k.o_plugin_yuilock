@@ -83,6 +83,7 @@ public class MainActivity extends Activity {
             }
         });
         findViewById(R.id.btnBattery).setOnClickListener(v -> batteryWhiteList());
+        findViewById(R.id.btnKeepAlive).setOnClickListener(v -> openKeepAliveSettings());
 
         requestPerms();
         poll();
@@ -236,6 +237,63 @@ public class MainActivity extends Activity {
                 startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
             } catch (Exception ignored) {
             }
+        }
+    }
+
+    /**
+     * 打开系统的「后台运行/自启动」管理页，防止 App 被系统冻结而收不到命令。
+     * 通用兼容链：按当前厂商优先尝试各主流品牌的设置页，全部打不开时回退到
+     * 标准的应用详情页（所有 Android 都有），用户可在其中找到权限/电池入口。
+     */
+    private void openKeepAliveSettings() {
+        String[][] candidates = {
+                // vivo / iQOO：自启动管理
+                {"com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"},
+                {"com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"},
+                {"com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager"},
+                // 小米 / 红米
+                {"com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"},
+                {"com.miui.securitycenter", "com.miui.powercenter.PowerSettings"},
+                // 华为 / 荣耀
+                {"com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"},
+                {"com.huawei.systemmanager", "com.huawei.systemmanager.optimize.process.ProtectActivity"},
+                {"com.huawei.systemmanager", "com.huawei.systemmanager.appcontrol.activity.StartupAppControlActivity"},
+                // OPPO / 一加 / realme
+                {"com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"},
+                {"com.coloros.safecenter", "com.coloros.safecenter.startupapp.StartupAppListActivity"},
+                {"com.oppo.safe", "com.oppo.safe.permission.startup.StartupAppListActivity"},
+                {"com.oneplus.security", "com.oneplus.security.chainlaunch.view.ChainLaunchAppListActivity"},
+                // 三星
+                {"com.samsung.android.lool", "com.samsung.android.sm.ui.battery.BatteryActivity"},
+                {"com.samsung.android.sm_cn", "com.samsung.android.sm.ui.battery.BatteryActivity"},
+                // 魅族
+                {"com.meizu.safe", "com.meizu.safe.permission.SmartBGActivity"},
+                {"com.meizu.safe", "com.meizu.safe.permission.PermissionMainActivity"},
+                // 华硕 / 诺基亚 / 一加等通用
+                {"com.asus.mobilemanager", "com.asus.mobilemanager.autostart.AutoStartActivity"},
+                {"com.asus.mobilemanager", "com.asus.mobilemanager.powersaver.PowerSaverSettings"},
+                {"com.letv.android.letvsafe", "com.letv.android.letvsafe.AutobootManageActivity"},
+        };
+        for (String[] c : candidates) {
+            try {
+                Intent i = new Intent();
+                i.setComponent(new ComponentName(c[0], c[1]));
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(i);
+                Toast.makeText(this, "请在打开的页面里允许「自启动/后台运行」", Toast.LENGTH_LONG).show();
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+        // 回退：标准应用详情页（所有设备都有）
+        try {
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+            Toast.makeText(this, "请在「电池/耗电管理」里允许后台运行", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "无法打开系统设置，请手动在系统设置里允许本应用后台运行", Toast.LENGTH_LONG).show();
         }
     }
 

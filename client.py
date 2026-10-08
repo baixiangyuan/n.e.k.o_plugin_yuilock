@@ -18,9 +18,14 @@ import hashlib
 import hmac
 import json
 import secrets
+import socket
+import tempfile
+from pathlib import Path
 from typing import Any, Optional
 
 CONTROL_CMDS = {"lock", "applock", "unlock"}
+
+STATE_PATH = Path(tempfile.gettempdir()) / "yuilock_phone_ip.json"
 
 
 def _auth_proof(token: str, cmd: str, nonce: str, challenge: str) -> str:
@@ -41,11 +46,18 @@ class YuiLockClient:
     # ---------------- 局域网 ----------------
 
     async def discover(self, timeout: float = 2.0) -> Optional[str]:
-        """UDP 广播发现手机（请求带随机数，回复必须原样回显），返回 IP。"""
+        """UDP 广播发现手机（请求带随机数，回复必须原样回显），返回 IP。
+
+        注意：不要用 remote_addr（connected UDP socket）——Windows/Linux 会丢弃
+        源地址不等于连接对端的回包，手机从真实 IP 回复就会被内核丢掉，
+        发现永远失败。这里用非连接 socket 显式 sendto，并向
+        255.255.255.255 和每个本地接口的子网广播地址各发一次（多网卡/多网段环境）。
+        """
         loop = asyncio.get_running_loop()
         found: asyncio.Queue = asyncio.Queue()
         nonce = secrets.token_hex(8)
         req = json.dumps({"yui_lock_discover": True, "n": nonce})
+        self_token = self.token
 
         class P(asyncio.DatagramProtocol):
             def datagram_received(self, data: bytes, addr):
@@ -64,17 +76,38 @@ class YuiLockClient:
                 except Exception:
                     pass
 
-        self_token = self.token
-
+        dests = self._broadcast_targets()
         transport, _ = await loop.create_datagram_endpoint(
-            P, remote_addr=("255.255.255.255", self.port), allow_broadcast=True)
+            P, local_addr=("0.0.0.0", 0), allow_broadcast=True)
         try:
-            transport.sendto(req.encode("utf-8"))
+            for dest in dests:
+                try:
+                    transport.sendto(req.encode("utf-8"), (dest, self.port))
+                except OSError:
+                    continue
             return await asyncio.wait_for(found.get(), timeout)
         except asyncio.TimeoutError:
             return None
         finally:
             transport.close()
+
+    @staticmethod
+    def _broadcast_targets() -> list[str]:
+        """255.255.255.255 + 本机每个 IPv4 网段的子网广播地址（192.168.1.x → 192.168.1.255）。"""
+        targets = ["255.255.255.255"]
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = info[4][0]
+                if not ip or ip.startswith("127.") or ip.startswith("169.254."):
+                    continue
+                parts = ip.split(".")
+                if len(parts) == 4:
+                    targets.append(".".join(parts[:3] + ["255"]))
+        except Exception:
+            pass
+        # 去重保序
+        seen: set[str] = set()
+        return [t for t in targets if not (t in seen or seen.add(t))]
 
     async def _exchange_lan(self, ip: str, payload: dict, timeout: float) -> dict:
         """在同一条 TCP 连接上完成（可能的）挑战-应答两步。"""
@@ -222,10 +255,43 @@ class YuiLockClient:
     async def _lan_path(self, payload: dict, timeout: float) -> dict:
         ip = self.host
         if ip in ("", "auto", "none", None):
-            ip = await self.discover()
+            # 1) 先试上次成功过的 IP（手机 IP 一般不变，跳过广播，更快更稳）
+            cached = self._load_cached_ip()
+            if cached:
+                try:
+                    return await self._exchange_lan(cached, payload, timeout)
+                except Exception:
+                    pass  # 缓存失效（换了网/手机重启），落到广播
+            # 2) 广播发现，多试两轮（手机从冻结中唤醒需要一点时间）
+            ip = None
+            for _ in range(2):
+                ip = await self.discover(timeout=2.5)
+                if ip:
+                    break
             if not ip:
-                raise RuntimeError("广播未发现手机（同一 Wi-Fi？App 在运行？）")
+                raise RuntimeError(
+                    "广播未发现手机。排查：① 手机 Yui Lock 服务是否已启动；"
+                    "② 手机与电脑是否同一 Wi-Fi（部分路由开了 AP 隔离）；"
+                    "③ 手机是否被系统冻结/杀后台——在 Yui Lock 里点「忽略电池优化」并"
+                    "允许自启动/后台运行（国产手机需在系统设置或管家应用里设置）")
+            self._save_cached_ip(ip)
         return await self._exchange_lan(ip, payload, timeout)
+
+    def _load_cached_ip(self) -> Optional[str]:
+        try:
+            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            ip = str(data.get("ip", "")).strip()
+            if ip and ip.count(".") == 3:
+                return ip
+        except Exception:
+            pass
+        return None
+
+    def _save_cached_ip(self, ip: str) -> None:
+        try:
+            STATE_PATH.write_text(json.dumps({"ip": ip}), encoding="utf-8")
+        except Exception:
+            pass
 
     async def _wrap_bt(self, payload: dict, timeout: float) -> dict:
         try:

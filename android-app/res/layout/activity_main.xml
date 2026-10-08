@@ -131,6 +131,13 @@
             android:layout_marginTop="4dp"
             android:text="@string/btn_battery" />
 
+        <Button
+            android:id="@+id/btnKeepAlive"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/btn_keep_alive" />
+
         <TextView
             android:id="@+id/tvHelp"
             android:layout_width="match_parent"
