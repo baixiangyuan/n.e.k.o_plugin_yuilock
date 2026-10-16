@@ -514,7 +514,7 @@ public class LockService extends Service implements CommandHandler.Host {
                                         .addCategory(Intent.CATEGORY_HOME)
                                         .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                                 startActivity(home);
-                                Thread.sleep(400);
+                                Thread.sleep(200);
                                 // 后台拉起可能被系统静默拒绝（Android 10+）：核验是否真的回到桌面
                                 String nowTop = queryTop(usm);
                                 if (top.equals(nowTop)) {
@@ -533,7 +533,8 @@ public class LockService extends Service implements CommandHandler.Host {
                             lastEvent = "应用锁已自动关闭：连续拦截失败（请授予「显示悬浮窗」权限后重试）";
                             return;
                         }
-                        Thread.sleep(300);
+                        // 120ms 轮询：App 冷启动常在 300ms 内就切到前台，间隔太长会漏检
+                        Thread.sleep(120);
                     } catch (InterruptedException ie) {
                         return;
                     } catch (Throwable t) {
@@ -558,7 +559,8 @@ public class LockService extends Service implements CommandHandler.Host {
     private String queryTop(UsageStatsManager usm) {
         try {
             long now = System.currentTimeMillis();
-            UsageEvents ev = usm.queryEvents(now - 3000, now);
+            // 窗口放宽到 6 秒：轮询加快后仍需覆盖上一次查询到现在的间隙，避免漏检
+            UsageEvents ev = usm.queryEvents(now - 6000, now);
             UsageEvents.Event e = new UsageEvents.Event();
             String top = null;
             while (ev.hasNextEvent()) {

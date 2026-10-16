@@ -83,7 +83,7 @@ public class MainActivity extends Activity {
             }
         });
         findViewById(R.id.btnBattery).setOnClickListener(v -> batteryWhiteList());
-        findViewById(R.id.btnKeepAlive).setOnClickListener(v -> openKeepAliveSettings());
+        findViewById(R.id.btnKeepAlive).setOnClickListener(v -> showKeepAliveTip());
 
         requestPerms();
         poll();
@@ -245,6 +245,19 @@ public class MainActivity extends Activity {
      * 通用兼容链：按当前厂商优先尝试各主流品牌的设置页，全部打不开时回退到
      * 标准的应用详情页（所有 Android 都有），用户可在其中找到权限/电池入口。
      */
+    /**
+     * 后台保活提示：先告诉用户最简单的方法（多任务界面下拉卡片锁定后台），
+     * 也提供跳转系统设置的入口。三种方法任选其一即可。
+     */
+    private void showKeepAliveTip() {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("防止被系统冻结")
+                .setMessage(getString(R.string.keep_alive_tip))
+                .setPositiveButton("去系统设置", (d, w) -> openKeepAliveSettings())
+                .setNegativeButton("知道了", null)
+                .show();
+    }
+
     private void openKeepAliveSettings() {
         String[][] candidates = {
                 // vivo / iQOO：自启动管理

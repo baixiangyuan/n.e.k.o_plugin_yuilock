@@ -1,9 +1,44 @@
 ﻿# YuiLock APK 构建脚本（aapt2 + javac + d8 + zipalign + apksigner，无 Gradle）
-# 自动探测 SDK/JDK（环境变量 → 常见路径 → 本机 E:\dev），签名密钥从仓库外读取：
+# 自动探测 SDK/JDK（环境变量 → 常见路径 → 本机 dev 目录），签名密钥从仓库外读取：
 #   $env:YUILOCK_KS_PATH / $env:YUILOCK_KS_PASS，或 <repo 同级>\keystore-backup\yuilock.keystore(.password)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $out = "$root\out"
+
+# aapt2 无法处理含中文的路径：把源码复制到纯 ASCII 临时目录再构建，产物拷回来
+function Test-AsciiOnly([string]$p) {
+    return ($p -match '^[\x20-\x7E]+$')
+}
+$selfPath = (Resolve-Path $root).Path
+if (-not (Test-AsciiOnly $selfPath)) {
+    $stage = Join-Path $env:TEMP 'yuilock_build_ascii'
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -Confirm:$false }
+    New-Item -ItemType Directory -Force $stage | Out-Null
+    Get-ChildItem $selfPath -Force | Where-Object { $_.Name -ne 'out' } |
+        Copy-Item -destination $stage -Recurse -Force
+    # 把原始（含中文）路径和 SDK/JDK/密钥位置通过环境变量带过去，避免相对路径失效
+    $env:YUILOCK_SRC_ROOT = $selfPath
+    $sdkGuess = Join-Path (Split-Path (Split-Path $selfPath -Parent) -Parent) 'android-sdk'
+    if (Test-Path $sdkGuess) { $env:ANDROID_SDK_ROOT = $sdkGuess }
+    $jdkGuess = Join-Path (Split-Path (Split-Path $selfPath -Parent) -Parent) 'jdk-17'
+    if (Test-Path $jdkGuess) { $env:JAVA_HOME = $jdkGuess }
+    $ksGuess = Join-Path (Split-Path (Split-Path $selfPath -Parent) -Parent) 'keystore-backup\yuilock.keystore'
+    if (Test-Path $ksGuess) { $env:YUILOCK_KS_PATH = $ksGuess }
+    $pwGuess = Join-Path (Split-Path (Split-Path $selfPath -Parent) -Parent) 'keystore-backup\yuilock.keystore.password'
+    if (Test-Path $pwGuess) { $env:YUILOCK_KS_PASS = (Get-Content $pwGuess -Raw).Trim() }
+    "==> 检测到中文路径，已复制到 ASCII 临时目录: $stage"
+    & powershell -ExecutionPolicy Bypass -File "$stage\build.ps1"
+    if ($LASTEXITCODE -ne 0) { throw "ASCII 临时目录构建失败" }
+    $stagedApk = Join-Path $stage 'out\YuiLock.apk'
+    if (Test-Path $stagedApk) {
+        New-Item -ItemType Directory -Force $out | Out-Null
+        Copy-Item $stagedApk "$out\YuiLock.apk" -Force
+        "==> 产物已拷回: $out\YuiLock.apk"
+        Remove-Item $stage -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+        exit 0
+    }
+    throw "ASCII 临时目录未产出 APK"
+}
 
 function Find-Tool([string[]]$candidates, [string]$probe) {
     foreach ($c in $candidates) {
@@ -15,6 +50,7 @@ function Find-Tool([string[]]$candidates, [string]$probe) {
 # ---------- SDK ----------
 $sdkCandidates = @(
     $env:ANDROID_SDK_ROOT, $env:ANDROID_HOME,
+    "$PSScriptRoot\..\..\android-sdk",
     "$env:USERPROFILE\android-tools\sdk",
     "E:\dev\android-sdk"
 )
@@ -22,7 +58,7 @@ $sdk = Find-Tool $sdkCandidates "platform-tools\adb.exe"
 if (-not $sdk) { throw "找不到 Android SDK（设置 ANDROID_SDK_ROOT 或放到 E:\dev\android-sdk）" }
 
 # ---------- JDK ----------
-$jdkCandidates = @($env:JAVA_HOME, "$env:USERPROFILE\android-tools\jdk", "E:\dev\jdk-17")
+$jdkCandidates = @($env:JAVA_HOME, "$PSScriptRoot\..\..\jdk-17", "$env:USERPROFILE\android-tools\jdk", "E:\dev\jdk-17")
 $jdk = Find-Tool $jdkCandidates "bin\javac.exe"
 if (-not $jdk) { throw "找不到 JDK（设置 JAVA_HOME 或放到 E:\dev\jdk-17）" }
 $env:JAVA_HOME = $jdk
@@ -57,7 +93,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 
 "==> aapt2 link"
-& "$bt\aapt2.exe" link -o "$out\base.apk" -I $aj --manifest "$root\AndroidManifest.xml" -R "$out\res.zip" --java "$out\gen" --min-sdk-version 26 --target-sdk-version 34 --version-code 7 --version-name 1.6.1 --auto-add-overlay
+& "$bt\aapt2.exe" link -o "$out\base.apk" -I $aj --manifest "$root\AndroidManifest.xml" -R "$out\res.zip" --java "$out\gen" --min-sdk-version 26 --target-sdk-version 34 --version-code 8 --version-name 1.6.2 --auto-add-overlay
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 
 "==> javac"
@@ -88,6 +124,9 @@ $ksCandidates += @(
     "$root\yuilock.keystore",                      # 旧布局（仓库内，已 gitignore）
     "$root\..\..\keystore-backup\yuilock.keystore" # repo 外 keystore-backup\（推荐）
 )
+if ($root -match '^(.+)\\n\.e\.k\.o_plugin_yuilock\\android-app$') {
+    $ksCandidates += (Join-Path $Matches[1] 'keystore-backup\yuilock.keystore')
+}
 $ks = $null
 foreach ($c in $ksCandidates) { if ($c -and (Test-Path $c)) { $ks = (Resolve-Path $c).Path; break } }
 if (-not $ks) { throw "找不到 yuilock.keystore（设置 YUILOCK_KS_PATH 或放到 repo 同级 keystore-backup\）" }
@@ -98,6 +137,9 @@ if (-not $ksPass) {
         "$root\..\..\keystore-backup\yuilock.keystore.password",
         "$root\keystore.password"
     )
+    if ($root -match '^(.+)\\n\.e\.k\.o_plugin_yuilock\\android-app$') {
+        $pwCandidates += (Join-Path $Matches[1] 'keystore-backup\yuilock.keystore.password')
+    }
     foreach ($c in $pwCandidates) { if ($c -and (Test-Path $c)) { $ksPass = (Get-Content $c -Raw).Trim(); break } }
 }
 if (-not $ksPass) { throw "找不到 keystore 口令（设置 YUILOCK_KS_PASS 或放 keystore.password 于 keystore-backup\）" }
