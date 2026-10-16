@@ -241,11 +241,6 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 打开系统的「后台运行/自启动」管理页，防止 App 被系统冻结而收不到命令。
-     * 通用兼容链：按当前厂商优先尝试各主流品牌的设置页，全部打不开时回退到
-     * 标准的应用详情页（所有 Android 都有），用户可在其中找到权限/电池入口。
-     */
-    /**
      * 后台保活提示：先告诉用户最简单的方法（多任务界面下拉卡片锁定后台），
      * 也提供跳转系统设置的入口。三种方法任选其一即可。
      */
@@ -258,6 +253,11 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /**
+     * 打开系统的「后台运行/自启动」管理页，防止 App 被系统冻结而收不到命令。
+     * 通用兼容链：按当前厂商优先尝试各主流品牌的设置页，全部打不开时回退到
+     * 标准的应用详情页（所有 Android 都有），用户可在其中找到权限/电池入口。
+     */
     private void openKeepAliveSettings() {
         String[][] candidates = {
                 // vivo / iQOO：自启动管理
@@ -312,6 +312,7 @@ public class MainActivity extends Activity {
 
     private void poll() {
         final TextView tvStatus = findViewById(R.id.tvStatus);
+        final TextView tvLockState = findViewById(R.id.tvLockState);
         final Button btnAdmin = findViewById(R.id.btnAdmin);
         Runnable r = new Runnable() {
             @Override
@@ -339,6 +340,16 @@ public class MainActivity extends Activity {
                 sb.append("应用锁: ").append(applockText).append('\n');
                 sb.append("最近事件: ").append(LockService.lastEvent);
                 tvStatus.setText(sb.toString());
+                // 大号状态头：锁定/未锁定一眼可见（演示/自检用）
+                if (intercepting) {
+                    tvLockState.setText("🔒 已锁定");
+                    tvLockState.setBackgroundColor(0xFFFFEBEE);
+                    tvLockState.setTextColor(0xFFC62828);
+                } else {
+                    tvLockState.setText("🔓 未锁定");
+                    tvLockState.setBackgroundColor(0xFFE8F5E9);
+                    tvLockState.setTextColor(0xFF2E7D32);
+                }
                 btnAdmin.setText(adminOk ? "① 锁屏权限已激活 ✓" : getString(R.string.btn_admin));
                 ui.postDelayed(this, 1000);
             }
