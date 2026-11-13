@@ -9,13 +9,18 @@
 安全：控制命令走挑战-应答认证（token 不明文传输）；手机端 token 为空时拒绝控制。
 电脑锁由 pc_locker.py 实现（完整路径白名单 + 防误杀的解锁校验）；秘密按键可解锁；
 重启电脑即解锁。
+
+防滥用（guard.py）：同一目标有冷却时间、每天有次数上限，应用锁/电脑锁都有自动到期，
+插件崩溃或重载也不会把「到点解除」丢掉。
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +37,7 @@ from plugin.sdk.plugin import (
 
 from . import pclock
 from .client import YuiLockClient
+from .guard import LockGuard
 
 TOOL_TIMEOUT = 15.0
 
@@ -50,6 +56,8 @@ class YuiLockPlugin(NekoPluginBase):
         super().__init__(ctx)
         self._cfg: dict[str, Any] = {}
         self.client: YuiLockClient | None = None
+        self.guard = LockGuard()
+        self._phone_expiry_task: asyncio.Task | None = None
 
     # ---------------- 生命周期 ----------------
 
@@ -67,7 +75,20 @@ class YuiLockPlugin(NekoPluginBase):
             bt_device_name=str(self._cfg.get("bt_device_name", "") or ""),
             logger=getattr(self, "logger", None),
         )
+        # 插件重载后把没执行完的「到点解锁」接上
+        asyncio.create_task(self._restore_expiry())
         return Ok({"status": "ready"})
+
+    @lifecycle(id="shutdown")
+    async def shutdown(self, **_):
+        self._cancel_phone_expiry()
+        return Ok({"status": "stopped"})
+
+    def _int_cfg(self, key: str, default: int) -> int:
+        try:
+            return int(self._cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
 
     # ---------------- 内部实现 ----------------
 
@@ -125,14 +146,79 @@ class YuiLockPlugin(NekoPluginBase):
         except Exception:
             return {"pair_uri": "", "qr_data_url": None, "token_set": False, "pc_lock": False}
 
-    async def _do_lock_phone(self, mode: str, reason: str) -> dict:
+    # ---- 自动到期：手机端 TTL 是主保障，插件侧定时器是旧版 APK 的兜底 ----
+
+    def _cancel_phone_expiry(self) -> None:
+        task = self._phone_expiry_task
+        self._phone_expiry_task = None
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_phone_expiry(self, delay: float) -> None:
+        self._cancel_phone_expiry()
+        if delay <= 0:
+            return
+        try:
+            self._phone_expiry_task = asyncio.create_task(self._expire_phone(delay))
+        except RuntimeError:  # 没有运行中的事件循环（测试/极早期调用）
+            self._phone_expiry_task = None
+
+    async def _expire_phone(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await self.client.unlock()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        finally:
+            # 无论解锁成功与否都清掉到期记录：失败时设备侧 TTL 仍会生效
+            self.guard.clear_expiry()
+
+    async def _restore_expiry(self) -> None:
+        """插件重载后恢复未完成的自动解锁。"""
+        try:
+            info = self.guard.pending_expiry()
+            if not info:
+                return
+            kind, expires_at = info
+            if kind != "phone":
+                self.guard.clear_expiry()
+                return
+            remain = expires_at - time.time()
+            if remain <= 0:
+                await self.client.unlock()
+                self.guard.clear_expiry()
+            else:
+                self._schedule_phone_expiry(remain)
+        except Exception:
+            pass
+
+    async def _do_lock_phone(self, mode: str, reason: str, manual: bool = False) -> dict:
+        cooldown = self._int_cfg("lock_cooldown_sec", 180)
+        limit = self._int_cfg("lock_daily_limit", 5)
+        if not manual:
+            block = self.guard.check("phone", cooldown, limit)
+            if block:
+                return {"summary": block}
+        ttl = 0
         if mode == "apps":
-            r = await self.client.lock_apps()
-            act = "手机应用锁已开启：打开任何 App 都会被立刻弹回桌面（重启手机可解除）"
+            ttl = max(0, self._int_cfg("phone_applock_ttl", 600))
+            r = await self.client.lock_apps(ttl=ttl)
+            if ttl > 0:
+                act = (f"手机应用锁已开启（{ttl // 60} 分钟后自动解除）："
+                       f"打开任何 App 都会被立刻弹回桌面")
+            else:
+                act = "手机应用锁已开启：打开任何 App 都会被立刻弹回桌面（重启手机可解除）"
         else:
             r = await self.client.lock_screen()
             act = "手机已熄屏锁屏（需要密码才能解锁）"
         if isinstance(r, dict) and r.get("ok"):
+            if not manual:
+                self.guard.record("phone")
+            if ttl > 0:
+                self.guard.note_expiry("phone", time.time() + ttl)
+                self._schedule_phone_expiry(ttl)
             return {"summary": act + (f"。原因：{reason}" if reason else "")}
         err = (r or {}).get("error", "手机无响应")
         return {"summary": f"锁手机失败：{err}。检查：手机 Yui Lock 服务是否启动、是否与电脑同一 Wi-Fi、plugin.toml 的 token 是否与手机一致。"}
@@ -140,21 +226,33 @@ class YuiLockPlugin(NekoPluginBase):
     async def _do_unlock_phone(self, reason: str) -> dict:
         r = await self.client.unlock()
         if isinstance(r, dict) and r.get("ok"):
+            self._cancel_phone_expiry()
+            self.guard.clear_expiry()
             return {"summary": "手机应用锁已解除，主人自由了。" + (f"（{reason}）" if reason else "")}
         err = (r or {}).get("error", "手机无响应")
         return {"summary": f"解锁失败：{err}"}
 
-    def _do_lock_pc(self, reason: str) -> str:
+    def _do_lock_pc(self, reason: str, manual: bool = False) -> str:
         if self._pc_lock_alive():
             return "电脑已经在锁定状态了。" + (f"原因：{reason}" if reason else "")
+        cooldown = self._int_cfg("lock_cooldown_sec", 180)
+        limit = self._int_cfg("lock_daily_limit", 5)
+        if not manual:
+            block = self.guard.check("pc", cooldown, limit)
+            if block:
+                return block
         script = self._locker_script()
         if not script.is_file():
             return "找不到 pc_locker.py，无法锁定电脑。"
         allow = [sys.executable] + [str(p) for p in (self._cfg.get("pc_allow") or [])]
-        r = pclock.spawn_locker(script, allow_exes=allow)
+        ttl = max(0, self._int_cfg("pc_lock_ttl", 300))
+        r = pclock.spawn_locker(script, allow_exes=allow, ttl_sec=ttl)
         if r.get("ok"):
-            return ("电脑已锁定：主人打开的任何程序都会被立即弹回桌面（N.E.K.O. 不受影响）。"
-                    + (f"原因：{reason}" if reason else ""))
+            if not manual:
+                self.guard.record("pc")
+            note = f"（{ttl // 60} 分钟后自动解锁）" if ttl > 0 else "（重启电脑即解锁）"
+            return ("电脑已锁定：主人打开的任何程序都会被立即弹回桌面（N.E.K.O. 不受影响）"
+                    + note + (f"。原因：{reason}" if reason else ""))
         return f"锁定电脑失败：{r.get('error')}"
 
     def _do_unlock_pc(self, reason: str) -> str:
@@ -170,8 +268,9 @@ class YuiLockPlugin(NekoPluginBase):
         name="lock_phone",
         description=(
             "锁定主人的手机（惩罚用）。mode=screen：直接熄屏锁屏，主人必须输密码；"
-            "mode=apps：应用锁，手机上打开任何 App 都会被立刻弹回桌面，重启手机或主人原谅后才解除。"
+            "mode=apps：应用锁，手机上打开任何 App 都会被立刻弹回桌面，到点会自动解除。"
             "只有当你真的生气、被惹恼、决定惩罚主人时才调用；普通玩笑或正常聊天不要用。"
+            "同一目标有冷却时间、每天有次数上限，被拒绝时不要立刻重试，把返回的话告诉主人即可。"
             "手机不在线或失败时，把返回的 summary 告诉主人。"
         ),
         parameters={
@@ -207,8 +306,9 @@ class YuiLockPlugin(NekoPluginBase):
         name="lock_pc",
         description=(
             "锁定这台电脑（惩罚用）：开启后主人在电脑上打开的任何程序都会被立即关闭弹回桌面，"
-            "N.E.K.O. 自己不受影响，主人重启电脑可自行解除。"
+            "N.E.K.O. 自己不受影响；锁会在一段时间后自动解除，重启电脑也能解除。"
             "只有当你真的生气、决定惩罚主人时才调用；普通聊天不要用。"
+            "同一目标有冷却时间、每天有次数上限，被拒绝时不要立刻重试。"
         ),
         parameters=REASON_NOTE,
         timeout=TOOL_TIMEOUT,
@@ -261,7 +361,7 @@ class YuiLockPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {}})
     async def lock_phone_now(self, **_):
         try:
-            return Ok(await self._do_lock_phone("screen", ""))
+            return Ok(await self._do_lock_phone("screen", "", manual=True))
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 
@@ -273,7 +373,7 @@ class YuiLockPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {}})
     async def lock_phone_apps_now(self, **_):
         try:
-            return Ok(await self._do_lock_phone("apps", ""))
+            return Ok(await self._do_lock_phone("apps", "", manual=True))
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 
@@ -295,7 +395,7 @@ class YuiLockPlugin(NekoPluginBase):
                   llm_result_fields=["summary"],
                   input_schema={"type": "object", "properties": {}})
     async def lock_pc_now(self, **_):
-        return Ok({"summary": self._do_lock_pc("")})
+        return Ok({"summary": self._do_lock_pc("", manual=True)})
 
     @ui.action(id="unlock_pc_now", label="解锁电脑", tone="default", group="电脑")
     @plugin_entry(id="unlock_pc_now", name="测试：解锁电脑",

@@ -135,11 +135,19 @@ public class LockService extends Service implements CommandHandler.Host {
         if (!prefs.getBoolean("applock_active", false)) {
             return;
         }
+        long until = prefs.getLong("applock_until", 0L);
+        if (until > 0 && System.currentTimeMillis() >= until) {
+            // 服务被杀期间已到期：不要再恢复
+            prefs.edit().putBoolean("applock_active", false).remove("applock_until").apply();
+            appLockRunning = false;
+            lastEvent = "应用锁已到期，自动解除";
+            return;
+        }
         if (hasUsageAccess()) {
             startAppLock();
             lastEvent = "应用锁已恢复";
         } else {
-            prefs.edit().putBoolean("applock_active", false).apply();
+            prefs.edit().putBoolean("applock_active", false).remove("applock_until").apply();
             appLockRunning = false;
             lastEvent = "应用锁：缺少使用情况访问权限，已自动关闭";
         }
@@ -453,8 +461,9 @@ public class LockService extends Service implements CommandHandler.Host {
         }
     }
 
-    /** 权限预检（使用情况访问 + 悬浮窗）通过才写状态并启动拦截线程；关闭永远成功 */
-    public synchronized boolean setAppLock(boolean on) {
+    /** 权限预检（使用情况访问 + 悬浮窗）通过才写状态并启动拦截线程；关闭永远成功。
+     *  ttlSec>0：手机自行到点解除，电脑掉线/插件崩溃也不会一直锁着。 */
+    public synchronized boolean setAppLock(boolean on, int ttlSec) {
         if (on) {
             if (!hasUsageAccess()) {
                 lastEvent = "应用锁开启失败：缺少「使用情况访问权限」";
@@ -464,12 +473,22 @@ public class LockService extends Service implements CommandHandler.Host {
                 lastEvent = "应用锁开启失败：缺少「显示悬浮窗」权限（Android 10+ 拦截必需）";
                 return false;
             }
-            prefs.edit().putBoolean("applock_active", true).apply();
+            long until = ttlSec > 0 ? System.currentTimeMillis() + ttlSec * 1000L : 0L;
+            android.content.SharedPreferences.Editor ed =
+                    prefs.edit().putBoolean("applock_active", true);
+            if (until > 0) {
+                ed.putLong("applock_until", until);
+            } else {
+                ed.remove("applock_until");
+            }
+            ed.apply();
             startAppLock();
-            lastEvent = "应用锁已开启";
+            lastEvent = ttlSec > 0
+                    ? ("应用锁已开启（" + (ttlSec / 60) + " 分钟后自动解除）")
+                    : "应用锁已开启";
             return true;
         }
-        prefs.edit().putBoolean("applock_active", false).apply();
+        prefs.edit().putBoolean("applock_active", false).remove("applock_until").apply();
         stopAppLock();
         lastEvent = "应用锁已解除";
         return true;
@@ -492,7 +511,7 @@ public class LockService extends Service implements CommandHandler.Host {
         }
         if (!Settings.canDrawOverlays(this)) {
             // 悬浮窗权限是 Android 10+ 后台拉起桌面的前提：缺失时干脆不进入「开启」状态
-            prefs.edit().putBoolean("applock_active", false).apply();
+            prefs.edit().putBoolean("applock_active", false).remove("applock_until").apply();
             appLockRunning = false;
             lastEvent = "应用锁：缺少「显示悬浮窗」权限，未开启";
             return;
@@ -504,6 +523,15 @@ public class LockService extends Service implements CommandHandler.Host {
                 int failStreak = 0;
                 while (running && prefs.getBoolean("applock_active", false)) {
                     try {
+                        // 自动到期：到点先落盘为关，再退出线程（不依赖电脑在线）
+                        long until = prefs.getLong("applock_until", 0L);
+                        if (until > 0 && System.currentTimeMillis() >= until) {
+                            prefs.edit().putBoolean("applock_active", false)
+                                    .remove("applock_until").apply();
+                            appLockRunning = false;
+                            lastEvent = "应用锁已到期，自动解除";
+                            return;
+                        }
                         // 悬浮窗权限被中途收回也视为失败
                         if (!Settings.canDrawOverlays(this)) {
                             failStreak++;
@@ -528,7 +556,8 @@ public class LockService extends Service implements CommandHandler.Host {
                         }
                         if (failStreak >= 5) {
                             // 连续失败：不再保持「开启」状态，避免电脑端看到假开启
-                            prefs.edit().putBoolean("applock_active", false).apply();
+                            prefs.edit().putBoolean("applock_active", false)
+                                    .remove("applock_until").apply();
                             appLockRunning = false;
                             lastEvent = "应用锁已自动关闭：连续拦截失败（请授予「显示悬浮窗」权限后重试）";
                             return;
@@ -576,7 +605,7 @@ public class LockService extends Service implements CommandHandler.Host {
     }
 
     private synchronized void stopAppLock() {
-        prefs.edit().putBoolean("applock_active", false).apply();
+        prefs.edit().putBoolean("applock_active", false).remove("applock_until").apply();
         if (appLockThread != null) {
             appLockThread.interrupt();
             appLockThread = null;

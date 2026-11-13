@@ -16,7 +16,7 @@ public class BootReceiver extends BroadcastReceiver {
             return;
         }
         context.getSharedPreferences("yuilock", Context.MODE_PRIVATE)
-                .edit().putBoolean("applock_active", false).apply();
+                .edit().putBoolean("applock_active", false).remove("applock_until").apply();
         Intent svc = new Intent(context, LockService.class);
         if (Build.VERSION.SDK_INT >= 26) {
             context.startForegroundService(svc);

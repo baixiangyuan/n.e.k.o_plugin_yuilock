@@ -60,6 +60,8 @@ ARGS.add_argument("--instance", required=True, help="本次锁定的唯一标识
 ARGS.add_argument("--state", required=True, help="状态文件路径")
 ARGS.add_argument("--allow", action="append", default=[],
                   help="额外放行的程序完整路径（如 N.E.K.O. 的 python.exe）")
+ARGS.add_argument("--ttl", type=int, default=0,
+                  help="自动解锁时间（秒）；0=不自动解锁，等插件/秘密按键/重启解除")
 OPTS = ARGS.parse_args()
 
 SELF_PATH = os.path.abspath(sys.executable).lower()
@@ -249,8 +251,11 @@ def main() -> None:
     threading.Thread(target=hook_thread, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=banner, daemon=True).start()
+    deadline = time.time() + OPTS.ttl if OPTS.ttl > 0 else 0.0
     try:
         while not state["unlocked"]:
+            if deadline and time.time() >= deadline:
+                break
             time.sleep(0.25)
     except KeyboardInterrupt:
         pass

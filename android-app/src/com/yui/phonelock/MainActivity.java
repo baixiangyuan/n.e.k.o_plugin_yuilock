@@ -340,9 +340,15 @@ public class MainActivity extends Activity {
                 sb.append("应用锁: ").append(applockText).append('\n');
                 sb.append("最近事件: ").append(LockService.lastEvent);
                 tvStatus.setText(sb.toString());
-                // 大号状态头：锁定/未锁定一眼可见（演示/自检用）
+                // 大号状态头：锁定/未锁定一眼可见（演示/自检用）；有到期时间就显示出来
                 if (intercepting) {
-                    tvLockState.setText("🔒 已锁定");
+                    long until = prefs.getLong("applock_until", 0L);
+                    if (until > System.currentTimeMillis()) {
+                        long leftMin = Math.max(1, (until - System.currentTimeMillis() + 59999) / 60000);
+                        tvLockState.setText("🔒 已锁定（" + leftMin + " 分钟后自动解除）");
+                    } else {
+                        tvLockState.setText("🔒 已锁定");
+                    }
                     tvLockState.setBackgroundColor(0xFFFFEBEE);
                     tvLockState.setTextColor(0xFFC62828);
                 } else {

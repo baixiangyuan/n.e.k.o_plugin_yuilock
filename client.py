@@ -305,8 +305,12 @@ class YuiLockClient:
     async def lock_screen(self) -> dict:
         return await self.send({"cmd": "lock"})
 
-    async def lock_apps(self) -> dict:
-        return await self.send({"cmd": "applock"})
+    async def lock_apps(self, ttl: int = 0) -> dict:
+        """开启应用锁。ttl>0 时请求手机端到点自动解除（旧版 APK 会忽略该字段）。"""
+        payload: dict = {"cmd": "applock"}
+        if ttl > 0:
+            payload["ttl"] = int(ttl)
+        return await self.send(payload)
 
     async def unlock(self) -> dict:
         return await self.send({"cmd": "unlock"})

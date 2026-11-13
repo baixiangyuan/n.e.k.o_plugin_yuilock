@@ -118,7 +118,9 @@ def _state_matches_process(st: dict) -> bool:
     return False
 
 
-def spawn_locker(script: Path, allow_exes: list[str] | None = None) -> dict:
+def spawn_locker(script: Path, allow_exes: list[str] | None = None,
+                 ttl_sec: int = 0) -> dict:
+    """启动锁机进程。ttl_sec>0 时锁机进程到点自行退出（插件崩溃也能解除）。"""
     if sys.platform != "win32":
         return {"ok": False, "error": "锁定电脑仅支持 Windows"}
     with _FileLock():
@@ -129,6 +131,8 @@ def spawn_locker(script: Path, allow_exes: list[str] | None = None) -> dict:
         pythonw = python.with_name("pythonw.exe")
         exe = str(pythonw if pythonw.exists() else python)
         args = [exe, str(script), "--instance", instance, "--state", str(STATE_PATH)]
+        if ttl_sec > 0:
+            args += ["--ttl", str(int(ttl_sec))]
         for p in (allow_exes or []):
             args += ["--allow", str(p)]
         try:

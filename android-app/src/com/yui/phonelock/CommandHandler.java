@@ -67,8 +67,8 @@ public final class CommandHandler {
 
         void lockScreen();
 
-        /** 返回 false 表示权限不足等，未开启（不落盘状态） */
-        boolean setAppLock(boolean on);
+        /** 返回 false 表示权限不足等，未开启（不落盘状态）。ttlSec>0 表示到点自动解除。 */
+        boolean setAppLock(boolean on, int ttlSec);
 
         int battery();
 
@@ -126,11 +126,12 @@ public final class CommandHandler {
                     resp = okJson("lock");
                     break;
                 case "applock":
-                    resp = h.setAppLock(true) ? okJson("applock")
+                    // ttl（秒）由电脑端下发：>0 时手机自行到点解除，不依赖电脑在线
+                    resp = h.setAppLock(true, req.optInt("ttl", 0)) ? okJson("applock")
                             : failJson("开启失败：请先授予「使用情况访问权限」和「显示悬浮窗」权限");
                     break;
                 case "unlock":
-                    h.setAppLock(false);
+                    h.setAppLock(false, 0);
                     resp = okJson("unlock");
                     break;
                 default:
