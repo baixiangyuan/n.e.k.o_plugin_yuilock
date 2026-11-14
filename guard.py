@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 
+
 def _state_dir() -> Path:
     """状态放用户数据目录（%LOCALAPPDATA%\\yuilock），不放在全员可写的 %TEMP%。"""
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
