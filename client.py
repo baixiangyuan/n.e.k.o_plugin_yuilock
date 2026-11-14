@@ -27,6 +27,10 @@ from typing import Any, Optional
 CONTROL_CMDS = {"lock", "applock", "unlock"}
 
 
+class DeliveryUncertain(Exception):
+    """命令已经写出，但没拿到可信响应：重试可能造成重复执行，调用方必须停止重试。"""
+
+
 def _state_dir() -> Path:
     """缓存放用户数据目录（%LOCALAPPDATA%\\yuilock），不放在全员可写的 %TEMP%。"""
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
@@ -125,9 +129,11 @@ class YuiLockClient:
     async def _exchange_lan(self, ip: str, payload: dict, timeout: float) -> dict:
         """在同一条 TCP 连接上完成（可能的）挑战-应答两步。"""
         reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, self.port), timeout)
+        sent = False
         try:
             writer.write((json.dumps(payload) + "\n").encode("utf-8"))
             await writer.drain()
+            sent = True
             line1 = await asyncio.wait_for(reader.readline(), timeout)
             if not line1:
                 raise RuntimeError("手机无响应")
@@ -156,6 +162,10 @@ class YuiLockClient:
                             "error": "响应签名校验失败，结果不可信（可能遭篡改）"}
                 return r2
             return r1
+        except Exception as exc:
+            if sent:
+                raise DeliveryUncertain(f"命令已发出但没收到可信响应（{exc}）") from exc
+            raise
         finally:
             writer.close()
             try:
@@ -280,11 +290,14 @@ class YuiLockClient:
             return await self._wrap_bt(payload, timeout)
         try:
             return await self._lan_path(payload, timeout)
+        except DeliveryUncertain as e:
+            # 命令可能已经执行：换通道/重发会导致重复锁机，直接报错让上层去确认状态
+            return {"ok": False, "error": f"{e}。为避免重复执行，已停止重试"}
         except Exception as e:
             if self.transport == "lan":
                 return {"ok": False, "error": f"局域网: {e}"}
             bt_err = await self._wrap_bt(payload, timeout)
-            return bt_err if bt_err.get("ok") or bt_err.get("auth") else {
+            return bt_err if bt_err.get("ok") else {
                 "ok": False, "error": f"局域网: {e}；蓝牙: {bt_err.get('error', '不可用')}"}
 
     async def _lan_path(self, payload: dict, timeout: float) -> dict:
@@ -295,6 +308,8 @@ class YuiLockClient:
             if cached:
                 try:
                     return await self._exchange_lan(cached, payload, timeout)
+                except DeliveryUncertain:
+                    raise
                 except Exception:
                     pass  # 缓存失效（换了网/手机重启），落到广播
             # 2) 广播发现，多试两轮（手机从冻结中唤醒需要一点时间）
@@ -323,10 +338,17 @@ class YuiLockClient:
         return None
 
     def _save_cached_ip(self, ip: str) -> None:
+        tmp = None
         try:
-            STATE_PATH.write_text(json.dumps({"ip": ip}), encoding="utf-8")
+            tmp = STATE_PATH.with_name(f"{STATE_PATH.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"ip": ip}), encoding="utf-8")
+            os.replace(tmp, STATE_PATH)
         except Exception:
-            pass
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
 
     async def _wrap_bt(self, payload: dict, timeout: float) -> dict:
         try:

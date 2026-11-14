@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+from urllib.parse import quote
 import socket
 import sys
 import time
@@ -74,7 +75,7 @@ class YuiLockPlugin(NekoPluginBase):
         self._cfg = section if isinstance(section, dict) else {}
         self.client = YuiLockClient(
             host=self._cfg.get("host", "auto"),
-            port=int(self._cfg.get("port", 48912) or 48912),
+            port=self._safe_port(),
             token=str(self._cfg.get("token", "") or ""),
             transport=str(self._cfg.get("transport", "auto") or "auto"),
             bt_device_name=str(self._cfg.get("bt_device_name", "") or ""),
@@ -109,6 +110,13 @@ class YuiLockPlugin(NekoPluginBase):
         except Exception:
             pass
 
+    def _safe_port(self) -> int:
+        try:
+            port = int(self._cfg.get("port", 48912))
+        except (TypeError, ValueError):
+            return 48912
+        return port if 1 <= port <= 65535 else 48912
+
     def _int_cfg(self, key: str, default: int) -> int:
         try:
             return int(self._cfg.get(key, default))
@@ -130,11 +138,18 @@ class YuiLockPlugin(NekoPluginBase):
         try:
             s.connect(("223.5.5.5", 80))
             ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+        finally:
+            s.close()
+        # 纯内网 / 没有默认路由时再用主机名兜底
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
             return "" if ip.startswith("127.") else ip
         except Exception:
             return ""
-        finally:
-            s.close()
 
     def _pair_host(self) -> str:
         host = str(self._cfg.get("host", "auto") or "auto")
@@ -167,7 +182,7 @@ class YuiLockPlugin(NekoPluginBase):
         if not token:
             return {"summary": "还没有设置配对令牌：先运行 pair_qr.py 生成并写入 token。",
                     "is_error": True}
-        uri = f"yuilock://pair?h={host}&p={port}&t={token}"
+        uri = f"yuilock://pair?h={quote(host, safe='')}&p={port}&t={quote(token, safe='')}"
         qr = None
         try:
             import qrcode
@@ -188,9 +203,11 @@ class YuiLockPlugin(NekoPluginBase):
 
     @ui.context(id="dashboard", title="Yui Lock")
     async def dashboard_context(self, **_):
-        """Hosted UI 面板的轻量上下文：配对二维码 + 电脑锁状态（不做网络请求）。"""
+        """Hosted UI 面板的轻量上下文：状态 + 电脑锁（探测丢到线程里）。"""
         try:
-            return self._pair_info()
+            info = self._pair_info()
+            info["pc_lock"] = await asyncio.to_thread(pclock.is_locker_alive)
+            return info
         except Exception:
             return {"pair_uri": "", "qr_data_url": None, "token_set": False, "pc_lock": False}
 
@@ -212,23 +229,41 @@ class YuiLockPlugin(NekoPluginBase):
         except RuntimeError:  # 没有运行中的事件循环（测试/极早期调用）
             self._phone_expiry_task = None
 
-    async def _expire_phone(self, delay: float, expires_at: float) -> None:
+    def _clear_expiry_if_current(self, expires_at: float) -> None:
+        """只有「当前任务」且「记录仍是本次到期时间」才清：
+        重新锁手机时旧任务被取消，不能把新写入的记录抹掉。"""
+        current = self._phone_expiry_task
+        if current is not None and current is asyncio.current_task():
+            pending = self.guard.pending_expiry()
+            if pending and abs(pending[1] - expires_at) < 0.001:
+                self.guard.clear_expiry()
+
+    async def _unlock_phone_checked(self) -> bool:
+        """真正检查解锁结果：返回 ok=False 时不能当作已解除。"""
         try:
-            await asyncio.sleep(delay)
-            await self.client.unlock()
+            r = await self.client.unlock()
+            return isinstance(r, dict) and bool(r.get("ok"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # 失败也清记录：设备侧 TTL 仍会兜底，不清会永远卡着
-            self._log("手机应用锁自动解除失败（设备侧 TTL 仍会生效）", exc)
-        finally:
-            # 只有「当前任务」且「记录仍是本次到期时间」才清：
-            # 重新锁手机时旧任务被取消，finally 不能把新写入的记录抹掉。
-            current = self._phone_expiry_task
-            if current is not None and current is asyncio.current_task():
-                pending = self.guard.pending_expiry()
-                if pending and abs(pending[1] - expires_at) < 0.001:
-                    self.guard.clear_expiry()
+            self._log("自动解锁请求失败", exc)
+            return False
+
+    async def _expire_phone(self, delay: float, expires_at: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            for attempt in range(10):
+                if await self._unlock_phone_checked():
+                    self._clear_expiry_if_current(expires_at)
+                    return
+                if attempt == 9:
+                    break
+                await asyncio.sleep(60)  # 失败保留记录，退避重试
+            self._log("自动解除连续失败，已停止重试（设备侧 TTL 仍会生效）")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log("自动解除任务异常", exc)
 
     async def _restore_expiry(self) -> None:
         """插件重载后恢复未完成的自动解锁。"""
@@ -242,8 +277,10 @@ class YuiLockPlugin(NekoPluginBase):
                 return
             remain = expires_at - time.time()
             if remain <= 0:
-                await self.client.unlock()
-                self.guard.clear_expiry()
+                if await self._unlock_phone_checked():
+                    self.guard.clear_expiry()
+                else:
+                    self._schedule_phone_expiry(60, expires_at)  # 保留记录并重试
             else:
                 self._schedule_phone_expiry(remain, expires_at)
         except asyncio.CancelledError:
@@ -280,11 +317,13 @@ class YuiLockPlugin(NekoPluginBase):
                 r = await self.client.lock_screen()
                 act = "手机已熄屏锁屏（需要密码才能解锁）"
             if isinstance(r, dict) and r.get("ok"):
+                expires_at = time.time() + ttl if ttl > 0 else None
                 if not manual:
-                    self.guard.record("phone")
-                if ttl > 0:
-                    expires_at = time.time() + ttl
+                    # 配额与到期时间一次落盘，避免崩溃时「扣了额度却没留记录」
+                    self.guard.record_with_expiry("phone", expires_at)
+                elif expires_at:
                     self.guard.note_expiry("phone", expires_at)
+                if expires_at:
                     self._schedule_phone_expiry(ttl, expires_at)
                 return {"summary": act + (f"。原因：{reason}" if reason else "")}
             err = (r or {}).get("error", "手机无响应")
@@ -384,7 +423,10 @@ class YuiLockPlugin(NekoPluginBase):
         timeout=TOOL_TIMEOUT,
     )
     async def lock_phone(self, *, mode: Any = "screen", reason: Any = None, **_):
-        mode_s = str(mode) if str(mode) in ("screen", "apps") else "screen"
+        mode_s = str(mode or "screen")
+        if mode_s not in ("screen", "apps"):
+            msg = "mode 只能是 screen 或 apps。"
+            return {"summary": msg, "is_error": True, "error": msg}
         return await self._do_lock_phone(mode_s, str(reason) if reason else "")
 
     @llm_tool(

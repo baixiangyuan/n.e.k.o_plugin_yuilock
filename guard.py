@@ -129,6 +129,27 @@ class LockGuard:
             self._save(data)
             self._last_mono[kind] = mono
 
+    def record_with_expiry(self, kind: str, expires_at: float | None = None) -> None:
+        """配额与到期时间一次落盘：避免「扣了额度却没留下到期记录」。"""
+        now = self._clock()
+        mono = self._mono()
+        with _STATE_LOCK:
+            data = self._load()
+            today = self._today(now)
+            if data.get("date") != today:
+                data = {"date": today, "count": 0}
+            data["count"] = int(data.get("count", 0) or 0) + 1
+            last = data.get("last_ts")
+            if not isinstance(last, dict):
+                last = {}
+            last[kind] = now
+            data["last_ts"] = last
+            if expires_at is not None and expires_at > 0:
+                data["expire_kind"] = kind
+                data["expires_at"] = float(expires_at)
+            self._save(data)
+            self._last_mono[kind] = mono
+
     # ---------------- 到期记录 ----------------
 
     def note_expiry(self, kind: str, expires_at: float) -> None:

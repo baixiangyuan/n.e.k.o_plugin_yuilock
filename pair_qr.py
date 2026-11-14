@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import secrets
 import socket
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import tomllib
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent
 
@@ -95,7 +97,7 @@ def main() -> None:
             print(f"[!] 配置里没有 token，已随机生成：{token}")
             print(f"    [!] 写回 plugin.toml 失败，请手动把 token = \"{token}\" 填进 [yuilock] 段。")
 
-    payload = f"yuilock://pair?h={host}&p={port}&t={token}"
+    payload = f"yuilock://pair?h={quote(host, safe='')}&p={port}&t={quote(token, safe='')}"
     print(f"配对信息：{payload}")
     print(f"如果手机扫码不便，也可以手动在 App 里填：端口 {port}，令牌 {token}")
 
@@ -112,7 +114,13 @@ def main() -> None:
     img = qr.make_image()
 
     # 二维码里含令牌：存到系统临时目录，不放插件目录（避免被提交/分享带走）
-    png_path = Path(tempfile.gettempdir()) / "yuilock_pair_qr.png"
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    data_dir = Path(base) / "yuilock"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        data_dir = Path(tempfile.gettempdir())
+    png_path = data_dir / "pair_qr.png"
     try:
         img.save(png_path)
         print(f"二维码已保存：{png_path}")

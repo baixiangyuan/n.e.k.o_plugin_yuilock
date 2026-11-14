@@ -113,7 +113,7 @@ uv run --with qrcode --with pillow python web_panel.py
    （首次没有依赖时会提示；也可 `pip install qrcode pillow` 后直接 `python pair_qr.py`）
 2. 电脑会弹出二维码窗口（自动探测局域网 IP、读取/生成配对令牌）。
 3. 手机 Yui Lock 点 **「③ 扫码配对」** 对准二维码 → 端口和令牌自动填好并保存。
-4. 二维码同时保存为 `pair_qr.png`，也兼容系统相机扫码（识别 `yuilock://pair?...` 深链）。
+4. 二维码同时保存为 `%LOCALAPPDATA%\yuilock\pair_qr.png`，也兼容系统相机扫码（识别 `yuilock://pair?...` 深链）。
 
 ## CI
 
@@ -137,7 +137,7 @@ python -m unittest discover -s tests -t . -v
 - **应用锁状态一致**：拦截线程真正在跑才算"开"；服务重启按已保存状态恢复并做权限预检，权限缺失自动清为关；重启手机即解除；到期时间到点由手机自己落盘关闭。
 - **紧急呼叫优先**：拨号器/电话/紧急呼叫包名与系统默认拨号器一律放行，通话中暂停拦截——应用锁不会挡住打电话。
 - **手机端 TTL 硬上限**：电脑传来的 ttl 为 0 时按 600 秒执行，超过 3600 秒会被截断，不存在「永久锁」。
-- **LLM 自主调用的风控**：同一目标冷却 + 每日总次数上限（`guard.py`，状态在 `%TEMP%`，插件重载不清零）；应用锁/电脑锁都有自动到期，误触发不会锁死主人。
+- **LLM 自主调用的风控**：同一目标冷却 + 每日总次数上限（`guard.py`，状态在 `%LOCALAPPDATA%\yuilock`，插件重载不清零）；应用锁/电脑锁都有自动到期，误触发不会锁死主人。
 - **Web 面板防滥用**：只监听 127.0.0.1；Host 必须是精确的 `127.0.0.1:<port>` / `localhost:<port>`（不用 startswith，`127.0.0.1.evil.com` 会被拒）；POST 还必须带同源 `Origin`、自定义头 `X-YuiLock-Panel` 和当次启动随机生成的 `X-YuiLock-Session`；请求体上限 64KB；危险操作二次确认；`/api/status` 与带令牌的 `/qr.png` 也必须携带会话令牌。面板默认**不下发**含令牌的 URI/二维码，点击「显示配对二维码」才在本地生成。会话令牌随页面 HTML 下发，能挡住跨站网页与 DNS rebinding；**但同机的恶意进程仍可先读页面拿到令牌**——本机已有恶意进程时，边界不在这一层。状态接口不回显配对令牌。
 - **配对令牌与二维码**：二维码内容形如 `yuilock://pair?h=…&p=…&t=<token>`，**含明文令牌**，只在本机面板/终端显示，不要截图外发；面板默认不下发二维码，点击「显示配对二维码」且在 5 分钟后自动隐藏；`pair_qr.py` 默认只显示令牌、不写回 `plugin.toml`（避免误提交到 git），需要写回时加 `--save`，二维码图片存系统临时目录不进插件目录。
 - **分发与签名**：签名口令不入库（环境变量 `YUILOCK_KS_PASS` 或本地 `keystore.password`，均已 gitignore）；每次构建输出 APK SHA256 与证书指纹，APK 只经 GitHub Releases 分发并核对校验和（旧 HTTP 网盘链接已弃用）。

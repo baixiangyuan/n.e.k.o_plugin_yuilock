@@ -36,6 +36,14 @@ class TestPluginStructure(unittest.TestCase):
             "根目录 plugin.toml 缺失",
         )
 
+    def test_version_synced(self):
+        import tomllib
+        with open(os.path.join(ROOT, "plugin.toml"), "rb") as fh:
+            plugin_ver = tomllib.load(fh)["plugin"]["version"]
+        with open(os.path.join(ROOT, "pyproject.toml"), "rb") as fh:
+            project_ver = tomllib.load(fh)["project"]["version"]
+        self.assertEqual(plugin_ver, project_ver, "两个版本号必须手动同步")
+
     def test_entry_module_exists(self):
         entry = os.path.join(ROOT, "__init__.py")
         self.assertTrue(os.path.isfile(entry), f"入口模块缺失: {entry}")

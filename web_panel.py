@@ -29,7 +29,7 @@ import sys
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import pclock
 from client import YuiLockClient
@@ -42,11 +42,18 @@ def detect_lan_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("223.5.5.5", 80))
-        return s.getsockname()[0]
+        ip = s.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
     except Exception:
-        return ""
+        pass
     finally:
         s.close()
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        return "" if ip.startswith("127.") else ip
+    except Exception:
+        return ""
 
 
 def load_config() -> dict:
@@ -98,7 +105,7 @@ def build_pair() -> tuple[str, bytes]:
         raise ValueError("没探测到局域网 IP：请在 plugin.toml 的 [yuilock] 里把 host 填成电脑的局域网地址")
     if not TOKEN:
         raise ValueError("还没有设置配对令牌：先运行 pair_qr.py 生成并写入 token")
-    uri = f"yuilock://pair?h={host}&p={PORT}&t={TOKEN}"
+    uri = f"yuilock://pair?h={quote(host, safe='')}&p={PORT}&t={quote(TOKEN, safe='')}"
     import qrcode
 
     code = qrcode.QRCode(border=2)

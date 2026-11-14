@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   verify:
-    uses: Project-N-E-K-O/N.E.K.O/.github/workflows/plugin-market-verify.yml@main
+    uses: Project-N-E-K-O/N.E.K.O/.github/workflows/plugin-market-verify.yml@5455f5ba845d6ba3f3cdac305436d03af332756d
     with:
       plugin-id: yuilock
       neko-repository: Project-N-E-K-O/N.E.K.O
