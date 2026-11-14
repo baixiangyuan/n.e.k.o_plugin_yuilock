@@ -28,6 +28,7 @@ import sys
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pclock
 from client import YuiLockClient
@@ -97,7 +98,9 @@ def run_action(name: str) -> dict:
         return {"ok": False, "message": f"锁定失败：{r.get('error')}"}
     if name == "unlock_pc":
         alive, msg = pclock.kill_locker()
-        return {"ok": True, "message": msg + ("（原本未锁定）" if not alive else "")}
+        # 如实返回：只有「确实解锁」或「本来就没锁」算成功，失败要让面板显示出来
+        idempotent = msg.startswith(("电脑当前没有锁定", "锁机进程已不存在"))
+        return {"ok": bool(alive or idempotent), "message": msg}
     return {"ok": False, "message": f"未知操作 {name}"}
 
 
@@ -130,7 +133,7 @@ img{width:200px;height:200px;background:#fff;border-radius:10px}
 <button class="gray" onclick="act('unlock_pc')">解锁电脑</button>
 </div>
 <div style="text-align:center">
-<img src="/qr.png" alt="配对二维码（需安装 qrcode 库）">
+<img src="/qr.png?s=__SESSION__" alt="配对二维码（需安装 qrcode 库）">
 <div><small>手机 App「扫码配对」</small></div>
 </div>
 </div>
@@ -138,7 +141,7 @@ img{width:200px;height:200px;background:#fff;border-radius:10px}
 <script>
 const SESSION = "__SESSION__";
 async function refresh(){
-  try{const r=await fetch('/api/status');const j=await r.json();
+  try{const r=await fetch('/api/status',{headers:{'X-YuiLock-Session':SESSION}});const j=await r.json();
   document.getElementById('status').textContent=j.text;}catch(e){
   document.getElementById('status').textContent='面板服务异常';}
 }
@@ -177,6 +180,9 @@ class Handler(BaseHTTPRequestHandler):
     def _origin_ok(self) -> bool:
         return origin_allowed(self.headers.get("Origin") or "", self.server.server_address[1])
 
+    def _session_ok(self, given: str) -> bool:
+        return hmac.compare_digest((given or "").encode("utf-8"), SESSION.encode("utf-8"))
+
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -193,10 +199,16 @@ class Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             self._send(403, b"forbidden", "text/plain")
             return
-        if self.path == "/":
+        parts = urlsplit(self.path)
+        path = parts.path
+        if path == "/":
             page = PAGE.replace("__SESSION__", SESSION)
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
-        elif self.path == "/api/status":
+        elif path == "/api/status":
+            # 状态里有局域网地址/机型/锁定状态，也要会话保护：本机其它进程不能直接读
+            if not self._session_ok(self.headers.get("X-YuiLock-Session") or ""):
+                self._send(403, b"forbidden", "text/plain")
+                return
             try:
                 p = asyncio.run(CLIENT.ping())
             except Exception as exc:
@@ -216,7 +228,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"text": f"手机：{phone}\n电脑锁：{'🔒 已锁定' if pc else '未锁定'}\n"
                                 f"配对令牌：{'已设置' if TOKEN else '⚠ 未设置'}\n"
                                 f"局域网地址：{LAN_IP}:{PORT}"})
-        elif self.path == "/qr.png":
+        elif path == "/qr.png":
+            # 二维码里带明文令牌：必须带会话参数，否则本机任意进程都能读走
+            token = (parse_qs(parts.query).get("s") or [""])[0]
+            if not self._session_ok(token):
+                self._send(403, b"forbidden", "text/plain")
+                return
             try:
                 import qrcode
                 qr = qrcode.QRCode(border=2)

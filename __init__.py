@@ -258,7 +258,9 @@ class YuiLockPlugin(NekoPluginBase):
 
     def _do_unlock_pc(self, reason: str) -> str:
         alive, msg = pclock.kill_locker()
-        out = msg + "。"
+        # alive=False 不一定失败：本来没锁 / 进程已不在 都属于「已经自由」
+        ok = alive or msg.startswith(("电脑当前没有锁定", "锁机进程已不存在"))
+        out = (msg if ok else f"解锁失败：{msg}") + "。"
         if reason:
             out += f"（{reason}）"
         return out

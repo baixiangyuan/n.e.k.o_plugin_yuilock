@@ -65,16 +65,22 @@ class TestKillLockerVerdicts(unittest.TestCase):
         self.assertFalse(self.p.STATE_PATH.exists())
 
     def test_confirmed_instance_kills(self):
-        self.p._pid_alive = lambda pid: True
+        alive_flag = {"v": True}
+        self.p._pid_alive = lambda pid: alive_flag["v"]
         self.p._win_process_path = lambda pid: self.state["exe"]
         self.p._win_process_cmdline_ctypes = lambda pid: (
             f'pythonw.exe pc_locker.py --instance {self.state["instance"]} --state x')
         killed = []
 
+        class FakeProc:
+            returncode = 0
+
         class FakeSub:
             @staticmethod
             def run(args, **kwargs):
                 killed.append(args)
+                alive_flag["v"] = False  # taskkill 生效
+                return FakeProc()
 
         self.p.subprocess = FakeSub
         alive, msg = self.p.kill_locker()
@@ -84,6 +90,27 @@ class TestKillLockerVerdicts(unittest.TestCase):
         if sys.platform == "win32":
             self.assertEqual(len(killed), 1)
         self.assertFalse(self.p.STATE_PATH.exists())
+
+    def test_taskkill_failure_keeps_state(self):
+        """taskkill 返回 0 但进程还在（权限不足）→ 必须报失败并保留状态。"""
+        self.p._pid_alive = lambda pid: True
+        self.p._win_process_path = lambda pid: self.state["exe"]
+        self.p._win_process_cmdline_ctypes = lambda pid: (
+            f'pythonw.exe pc_locker.py --instance {self.state["instance"]} --state x')
+
+        class FakeProc:
+            returncode = 1
+
+        class FakeSub:
+            @staticmethod
+            def run(args, **kwargs):
+                return FakeProc()
+
+        self.p.subprocess = FakeSub
+        alive, msg = self.p.kill_locker()
+        self.assertFalse(alive)
+        self.assertIn("失败", msg)
+        self.assertTrue(self.p.STATE_PATH.exists(), "杀不掉时不能删状态")
 
     def test_instance_mismatch_is_not_confirmed(self):
         self.p._pid_alive = lambda pid: True

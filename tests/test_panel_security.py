@@ -68,6 +68,36 @@ class TestSessionToken(unittest.TestCase):
     def test_post_headers_include_session(self):
         self.assertIn("X-YuiLock-Session", panel.PAGE)
 
+    def test_qr_image_carries_session(self):
+        # 二维码带明文令牌，必须凭会话拿，不能裸奔给本机任意进程
+        self.assertIn("/qr.png?s=__SESSION__", panel.PAGE)
+
+    def test_status_fetch_sends_session(self):
+        self.assertIn("'/api/status',{headers:{'X-YuiLock-Session':SESSION}}", panel.PAGE)
+
+
+class TestUnlockPcReportsTruth(unittest.TestCase):
+    def _run_with(self, result):
+        orig = panel.pclock.kill_locker
+        panel.pclock.kill_locker = lambda: result
+        try:
+            return panel.run_action("unlock_pc")
+        finally:
+            panel.pclock.kill_locker = orig
+
+    def test_success(self):
+        r = self._run_with((True, "电脑已解锁，恢复自由"))
+        self.assertTrue(r["ok"])
+
+    def test_not_locked_is_ok(self):
+        r = self._run_with((False, "电脑当前没有锁定"))
+        self.assertTrue(r["ok"])
+
+    def test_failure_is_not_ok(self):
+        r = self._run_with((False, "结束锁机进程失败（可能权限不足），状态已保留"))
+        self.assertFalse(r["ok"], "杀不掉时面板不能报成功")
+        self.assertIn("失败", r["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

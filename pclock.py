@@ -12,6 +12,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -281,8 +282,20 @@ def kill_locker() -> tuple[bool, str]:
             return False, "锁机进程已不存在（可能崩溃或重启过），残留状态已清理"
         pid = int(st["pid"])
         if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                           capture_output=True, creationflags=CREATE_NO_WINDOW)
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=15,
+                               creationflags=CREATE_NO_WINDOW)
+            except Exception as exc:
+                return False, f"调用 taskkill 失败（{exc}），状态已保留"
+        # 不能凭 taskkill 的返回码下结论：以「进程是否真的消失」为准（最多等 1 秒）
+        for _ in range(20):
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.05)
+        if _pid_alive(pid):
+            return False, ("结束锁机进程失败（可能权限不足），状态已保留；"
+                           "请用任务管理器结束 pythonw.exe")
         try:
             STATE_PATH.unlink()
         except Exception:
