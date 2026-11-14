@@ -8,8 +8,12 @@ on:
       - "v*"
   workflow_dispatch:
 
+# 被调用的 plugin-market-release.yml 里 attest job 需要三个权限，
+# 调用方没授全会被 GitHub 判为 startup_failure（job 都不会创建）。
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
