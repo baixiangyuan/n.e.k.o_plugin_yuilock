@@ -91,8 +91,12 @@ def run_action(name: str) -> dict:
     if name == "lock_pc":
         if pclock.is_locker_alive():
             return {"ok": True, "message": "电脑已经处于锁定状态"}
-        # 面板锁电脑也强制到期：面板崩了/人走了也一定会自己解开
-        r = pclock.spawn_locker(LOCKER, allow_exes=ALLOW_EXES, ttl_sec=300)
+        # 面板锁电脑沿用配置里的 pc_lock_ttl（0=不自动解除），不再是写死的 300
+        try:
+            ttl = int(CFG.get("pc_lock_ttl", 300))
+        except (TypeError, ValueError):
+            ttl = 300
+        r = pclock.spawn_locker(LOCKER, allow_exes=ALLOW_EXES, ttl_sec=max(0, ttl))
         if r.get("ok"):
             return {"ok": True, "message": "电脑已锁定：打开任何程序都会被立即弹回桌面"}
         return {"ok": False, "message": f"锁定失败：{r.get('error')}"}

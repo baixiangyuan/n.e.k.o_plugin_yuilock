@@ -1,8 +1,20 @@
 [project]
 name = "yuilock"
-version = "1.7.3"
+version = "1.7.4"
 description = "Yui 手机/电脑锁"
-# 局域网通道零依赖。蓝牙通道为可选项，需要时在 N.E.K.O. 的 Python 环境安装：
-#   pip install winrt-runtime winrt-Windows.Devices.Bluetooth winrt-Windows.Devices.Bluetooth.Rfcomm winrt-Windows.Devices.Enumeration winrt-Windows.Networking.Sockets winrt-Windows.Storage.Streams
+# 局域网通道零依赖；二维码与蓝牙是可选能力，见下方 optional-dependencies。
 license = { text = "MIT" }
 dependencies = []
+
+[project.optional-dependencies]
+# 内置面板显示配对二维码用
+qr = ["qrcode", "pillow"]
+# 蓝牙通道（可选）
+bt = [
+  "winrt-runtime",
+  "winrt-Windows.Devices.Bluetooth",
+  "winrt-Windows.Devices.Bluetooth.Rfcomm",
+  "winrt-Windows.Devices.Enumeration",
+  "winrt-Windows.Networking.Sockets",
+  "winrt-Windows.Storage.Streams",
+]

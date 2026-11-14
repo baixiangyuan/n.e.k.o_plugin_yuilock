@@ -4,10 +4,10 @@
 用法（在插件目录下）：
     uv run --with qrcode --with pillow python pair_qr.py
 或已安装依赖时：
-    python pair_qr.py [--host 局域网IP] [--port 48912] [--token 令牌] [--no-save]
+    python pair_qr.py [--host 局域网IP] [--port 48912] [--token 令牌] [--save]
 
 - 配置里 token 为空时会随机生成一个，并自动写回 plugin.toml 的 [yuilock] token
-  （写回后请在插件卡片上点「重载」使其生效；--no-save 可跳过写回）。
+  （默认只显示不写回；加 --save 才写回 plugin.toml，写回后点「重载」生效）。
 - 二维码图片保存在系统临时目录（不落在插件目录里，避免令牌被一起提交/分享）。
 """
 from __future__ import annotations
@@ -74,7 +74,8 @@ def main() -> None:
     ap.add_argument("--host", help="局域网 IP（默认自动探测）")
     ap.add_argument("--port", type=int, help="端口（默认读配置，其次 48912）")
     ap.add_argument("--token", help="配对令牌（默认读配置，为空则随机生成并写回配置）")
-    ap.add_argument("--no-save", action="store_true", help="不把生成的令牌写回 plugin.toml")
+    ap.add_argument("--save", action="store_true",
+                    help="把生成的令牌写回 plugin.toml（默认不写，避免误提交到 git）")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -82,10 +83,11 @@ def main() -> None:
     port = args.port or int(cfg.get("port", 48912) or 48912)
     token = args.token or str(cfg.get("token", "") or "")
     if not token:
-        token = "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(12))
-        if args.no_save:
+        # 24 位（约 120 bit）：抓一次握手也无法离线爆破
+        token = "".join(secrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(24))
+        if not args.save:
             print(f"[!] 配置里没有 token，已随机生成：{token}")
-            print("    (--no-save) 未写回，请自行同步到 plugin.toml 的 [yuilock] token")
+            print("    未写回 plugin.toml（避免误提交到 git）；需要写回请加 --save")
         elif save_token_to_toml(token):
             print(f"[!] 配置里没有 token，已随机生成并写回 plugin.toml：{token}")
             print("    请在插件管理器里对本插件点「重载」使其生效。")

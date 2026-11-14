@@ -69,7 +69,9 @@ ALLOW_PATHS = {os.path.abspath(p).lower() for p in OPTS.allow}
 # 系统外壳白名单：只认「完整路径」，保留扩展名与点号，不做任何名字折叠
 SYSTEM_ROOT = os.environ.get("SystemRoot", r"C:\Windows").lower()
 SHELL_ROOT_FILES = {"explorer.exe"}
-SHELL_SYSTEM32_FILES = {"runtimebroker.exe"}
+# taskmgr 放行是刻意的：README 承诺「任务管理器可解除」，而强杀 explorer 之外的
+# 进程可能丢数据。把它当官方应急出口，好过让主人去拔电源。
+SHELL_SYSTEM32_FILES = {"runtimebroker.exe", "taskmgr.exe"}
 SHELL_SYSTEMAPP_PACKAGES = (
     "microsoft.windows.search_",
     "microsoft.windows.startmenuexperiencehost_",

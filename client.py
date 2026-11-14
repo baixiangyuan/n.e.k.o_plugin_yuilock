@@ -180,23 +180,32 @@ class YuiLockClient:
         if svc is None:
             return {"ok": False, "error": "手机蓝牙服务不可达（确认手机上 Yui Lock 服务已启动）"}
         sock = wns.StreamSocket()
-        await asyncio.wait_for(sock.connect_async(
-            svc.connection_host_name, svc.connection_service_name), timeout)
+        reader = wst.DataReader(sock.input_stream)
+
+        async def read_line() -> dict:
+            """读到完整的 \n 为止——load_async(4096) 只保证有数据，不保证一整行。"""
+            buf = b""
+            while b"\n" not in buf:
+                n = reader.unconsumed_data_length
+                if not n:
+                    await asyncio.wait_for(reader.load_async(1), timeout)
+                    n = reader.unconsumed_data_length
+                    if not n:
+                        raise RuntimeError("手机无响应")
+                buf += bytes(reader.read_bytes(n))
+            line = buf.split(b"\n", 1)[0]
+            return json.loads(line.decode("utf-8"))
 
         async def send_recv(pl: dict) -> dict:
             writer = wst.DataWriter(sock.output_stream)
             writer.write_bytes((json.dumps(pl) + "\n").encode("utf-8"))
             await writer.store_async()
             await writer.flush_async()
-            reader = wst.DataReader(sock.input_stream)
-            await asyncio.wait_for(reader.load_async(4096), timeout)
-            n = reader.unconsumed_data_length
-            data = bytes(reader.read_bytes(n)) if n else b""
-            if not data:
-                raise RuntimeError("手机无响应")
-            return json.loads(data.decode("utf-8"))
+            return await read_line()
 
         try:
+            await asyncio.wait_for(sock.connect_async(
+                svc.connection_host_name, svc.connection_service_name), timeout)
             r1 = await send_recv(payload)
             if payload.get("cmd") in CONTROL_CMDS:
                 is_envelope = r1.get("auth") == "hmac-sha256" and r1.get("challenge")
@@ -216,7 +225,10 @@ class YuiLockClient:
                 return r2
             return r1
         finally:
-            sock.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     def _verify_resp(self, r2: dict, payload: dict, challenge: str) -> bool:
         """核对手机对最终结果的 HMAC（覆盖 challenge/命令/nonce/结果）。"""
@@ -233,7 +245,17 @@ class YuiLockClient:
     # ---------------- 对外 ----------------
 
     async def send(self, payload: dict, timeout: float = 8.0) -> dict:
-        """发送命令。控制命令在同一条连接上自动完成挑战-应答认证。"""
+        """发送命令。整体加一道硬超时：广播两轮 + 蓝牙回退可能远超单次 timeout。"""
+        budget = timeout * 2 + 4.0
+        try:
+            return await asyncio.wait_for(self._send(payload, timeout), budget)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "手机响应超时（检查 Wi-Fi/蓝牙与手机端服务）"}
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    async def _send(self, payload: dict, timeout: float) -> dict:
+        """真正的发送逻辑（由 send() 包超时）。控制命令在同一条连接完成挑战-应答。"""
         payload = dict(payload)
         cmd = payload.get("cmd")
         if cmd in CONTROL_CMDS:
