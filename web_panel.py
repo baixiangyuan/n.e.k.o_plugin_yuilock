@@ -28,7 +28,7 @@ import sys
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 import pclock
 from client import YuiLockClient
@@ -43,7 +43,7 @@ def detect_lan_ip() -> str:
         s.connect(("223.5.5.5", 80))
         return s.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        return ""
     finally:
         s.close()
 
@@ -69,17 +69,48 @@ CLIENT = YuiLockClient(
 TOKEN = str(CFG.get("token", "") or "")
 PORT = int(CFG.get("port", 48912) or 48912)
 LAN_IP = detect_lan_ip()
-PAIR_URI = f"yuilock://pair?h={LAN_IP}&p={PORT}&t={TOKEN}"
 ALLOW_EXES = [sys.executable] + [str(p) for p in (CFG.get("pc_allow") or [])]
 
 # 每次启动生成的一次性会话令牌：嵌进页面脚本，POST 必须带上。
 # 就算 DNS rebinding 骗过了 Host，同源策略也让恶意页面读不到这个值。
 SESSION = secrets.token_urlsafe(24)
+
+
+def _int_cfg(key: str, default: int) -> int:
+    try:
+        return max(0, int(CFG.get(key, default)))
+    except (TypeError, ValueError):
+        return default
 MAX_BODY = 64 * 1024
+
+def pair_host() -> str:
+    h = str(CFG.get("host", "auto") or "auto")
+    if h in ("", "auto", "none"):
+        h = detect_lan_ip()
+    return h
+
+
+def build_pair() -> tuple[str, bytes]:
+    """按需生成配对 URI 与二维码 PNG；失败抛 ValueError（消息直接显示给用户）。"""
+    host = pair_host()
+    if not host or host.startswith("127."):
+        raise ValueError("没探测到局域网 IP：请在 plugin.toml 的 [yuilock] 里把 host 填成电脑的局域网地址")
+    if not TOKEN:
+        raise ValueError("还没有设置配对令牌：先运行 pair_qr.py 生成并写入 token")
+    uri = f"yuilock://pair?h={host}&p={PORT}&t={TOKEN}"
+    import qrcode
+
+    code = qrcode.QRCode(border=2)
+    code.add_data(uri)
+    code.make(fit=True)
+    buf = io.BytesIO()
+    code.make_image().save(buf, format="PNG")
+    return uri, buf.getvalue()
+
 
 ACTIONS = {
     "lock_screen": lambda: CLIENT.lock_screen(),
-    "lock_apps": lambda: CLIENT.lock_apps(),
+    "lock_apps": lambda: CLIENT.lock_apps(ttl=_int_cfg("phone_applock_ttl", 600)),
     "unlock_phone": lambda: CLIENT.unlock(),
 }
 DANGEROUS = {"lock_screen", "lock_apps", "lock_pc"}
@@ -96,7 +127,8 @@ def run_action(name: str) -> dict:
             ttl = int(CFG.get("pc_lock_ttl", 300))
         except (TypeError, ValueError):
             ttl = 300
-        r = pclock.spawn_locker(LOCKER, allow_exes=ALLOW_EXES, ttl_sec=max(0, ttl))
+        r = pclock.spawn_locker(LOCKER, allow_exes=ALLOW_EXES, ttl_sec=max(0, ttl),
+                               force_kill=bool(CFG.get("pc_force_kill", False)))
         if r.get("ok"):
             return {"ok": True, "message": "电脑已锁定：打开任何程序都会被立即弹回桌面"}
         return {"ok": False, "message": f"锁定失败：{r.get('error')}"}
@@ -136,13 +168,31 @@ img{width:200px;height:200px;background:#fff;border-radius:10px}
 <button class="gray" onclick="act('unlock_pc')">解锁电脑</button>
 </div>
 <div style="text-align:center">
-<img src="/qr.png?s=__SESSION__" alt="配对二维码（需安装 qrcode 库）">
-<div><small>手机 App「扫码配对」</small></div>
+<img id="qrimg" alt="配对二维码" style="display:none">
+<button class="gray" onclick="showQr()">显示配对二维码</button>
+<div><small>手机 App「扫码配对」（含令牌，5 分钟后自动隐藏）</small></div>
 </div>
 </div>
 <div id="msg"></div></div>
 <script>
 const SESSION = "__SESSION__";
+let qrUrl = null;
+async function showQr(){
+  const msg = document.getElementById('msg');
+  msg.textContent = '生成中…';
+  try{
+    const r = await fetch('/qr.png', {headers: {'X-YuiLock-Session': SESSION}});
+    if(!r.ok){ msg.textContent = await r.text(); return; }
+    const blob = await r.blob();
+    if(qrUrl) URL.revokeObjectURL(qrUrl);
+    qrUrl = URL.createObjectURL(blob);
+    const img = document.getElementById('qrimg');
+    img.src = qrUrl;
+    img.style.display = 'block';
+    msg.textContent = '二维码含明文令牌，请勿截图外发';
+    setTimeout(() => { img.style.display = 'none'; if(qrUrl){ URL.revokeObjectURL(qrUrl); qrUrl = null; } }, 300000);
+  }catch(e){ msg.textContent = '生成失败：' + e; }
+}
 async function refresh(){
   try{const r=await fetch('/api/status',{headers:{'X-YuiLock-Session':SESSION}});const j=await r.json();
   document.getElementById('status').textContent=j.text;}catch(e){
@@ -232,22 +282,18 @@ class Handler(BaseHTTPRequestHandler):
                                 f"配对令牌：{'已设置' if TOKEN else '⚠ 未设置'}\n"
                                 f"局域网地址：{LAN_IP}:{PORT}"})
         elif path == "/qr.png":
-            # 二维码里带明文令牌：必须带会话参数，否则本机任意进程都能读走
-            token = (parse_qs(parts.query).get("s") or [""])[0]
-            if not self._session_ok(token):
+            # 二维码里带明文令牌：必须带会话头（不放进 URL），且按需生成
+            if not self._session_ok(self.headers.get("X-YuiLock-Session") or ""):
                 self._send(403, b"forbidden", "text/plain")
                 return
             try:
-                import qrcode
-                qr = qrcode.QRCode(border=2)
-                qr.add_data(PAIR_URI)
-                qr.make(fit=True)
-                import io
-                buf = io.BytesIO()
-                qr.make_image().save(buf, format="PNG")
-                self._send(200, buf.getvalue(), "image/png")
+                _uri, png = build_pair()
+                self._send(200, png, "image/png")
+            except ValueError as exc:
+                self._send(409, str(exc).encode("utf-8"), "text/plain; charset=utf-8")
             except Exception:
                 self._send(404, b"qrcode lib missing", "text/plain")
+            return
         else:
             self._send(404, b"not found", "text/plain")
 

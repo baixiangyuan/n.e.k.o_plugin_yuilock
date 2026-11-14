@@ -41,7 +41,7 @@ from .guard import LockGuard
 
 # 必须大于 client.send 的最坏耗时（timeout*2+4 = 20s），否则工具先超时、
 # 手机已经执行了但插件没来得及记账/登记到期时间。
-TOOL_TIMEOUT = 25.0
+TOOL_TIMEOUT = 45.0
 
 REASON_NOTE = {
     "type": "object",
@@ -202,16 +202,17 @@ class YuiLockPlugin(NekoPluginBase):
         if task and not task.done():
             task.cancel()
 
-    def _schedule_phone_expiry(self, delay: float) -> None:
+    def _schedule_phone_expiry(self, delay: float, expires_at: float) -> None:
         self._cancel_phone_expiry()
         if delay <= 0:
             return
         try:
-            self._phone_expiry_task = asyncio.create_task(self._expire_phone(delay))
+            self._phone_expiry_task = asyncio.create_task(
+                self._expire_phone(delay, expires_at))
         except RuntimeError:  # 没有运行中的事件循环（测试/极早期调用）
             self._phone_expiry_task = None
 
-    async def _expire_phone(self, delay: float) -> None:
+    async def _expire_phone(self, delay: float, expires_at: float) -> None:
         try:
             await asyncio.sleep(delay)
             await self.client.unlock()
@@ -221,7 +222,13 @@ class YuiLockPlugin(NekoPluginBase):
             # 失败也清记录：设备侧 TTL 仍会兜底，不清会永远卡着
             self._log("手机应用锁自动解除失败（设备侧 TTL 仍会生效）", exc)
         finally:
-            self.guard.clear_expiry()
+            # 只有「当前任务」且「记录仍是本次到期时间」才清：
+            # 重新锁手机时旧任务被取消，finally 不能把新写入的记录抹掉。
+            current = self._phone_expiry_task
+            if current is not None and current is asyncio.current_task():
+                pending = self.guard.pending_expiry()
+                if pending and abs(pending[1] - expires_at) < 0.001:
+                    self.guard.clear_expiry()
 
     async def _restore_expiry(self) -> None:
         """插件重载后恢复未完成的自动解锁。"""
@@ -238,7 +245,7 @@ class YuiLockPlugin(NekoPluginBase):
                 await self.client.unlock()
                 self.guard.clear_expiry()
             else:
-                self._schedule_phone_expiry(remain)
+                self._schedule_phone_expiry(remain, expires_at)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -247,8 +254,14 @@ class YuiLockPlugin(NekoPluginBase):
     async def _do_lock_phone(self, mode: str, reason: str, manual: bool = False) -> dict:
         cooldown = self._int_cfg("lock_cooldown_sec", 180)
         limit = self._int_cfg("lock_daily_limit", 5)
-        # 整个「检查 → 下发 → 记账」串行化：两次并发调用不会都通过冷却
-        async with self._lock_gate:
+        # 整个「检查 → 下发 → 记账」串行化：两次并发调用不会都通过冷却。
+        # 等不到锁就立刻返回：排队 20 秒只会拖爆工具超时，而且手机可能已经执行了。
+        try:
+            await asyncio.wait_for(self._lock_gate.acquire(), timeout=3.0)
+        except asyncio.TimeoutError:
+            msg = "另一个锁机操作还在进行，请过几秒再试。"
+            return {"summary": msg, "is_error": True, "error": msg}
+        try:
             if not manual:
                 block = self.guard.check("phone", cooldown, limit)
                 if block:
@@ -270,15 +283,23 @@ class YuiLockPlugin(NekoPluginBase):
                 if not manual:
                     self.guard.record("phone")
                 if ttl > 0:
-                    self.guard.note_expiry("phone", time.time() + ttl)
-                    self._schedule_phone_expiry(ttl)
+                    expires_at = time.time() + ttl
+                    self.guard.note_expiry("phone", expires_at)
+                    self._schedule_phone_expiry(ttl, expires_at)
                 return {"summary": act + (f"。原因：{reason}" if reason else "")}
             err = (r or {}).get("error", "手机无响应")
             msg = f"锁手机失败：{err}。检查：手机 Yui Lock 服务是否启动、是否与电脑同一 Wi-Fi、plugin.toml 的 token 是否与手机一致。"
             return {"summary": msg, "is_error": True, "error": msg}
+        finally:
+            self._lock_gate.release()
 
     async def _do_unlock_phone(self, reason: str) -> dict:
-        async with self._lock_gate:
+        try:
+            await asyncio.wait_for(self._lock_gate.acquire(), timeout=3.0)
+        except asyncio.TimeoutError:
+            msg = "另一个锁机操作还在进行，请过几秒再试。"
+            return {"summary": msg, "is_error": True, "error": msg}
+        try:
             r = await self.client.unlock()
             if isinstance(r, dict) and r.get("ok"):
                 self._cancel_phone_expiry()
@@ -287,12 +308,18 @@ class YuiLockPlugin(NekoPluginBase):
             err = (r or {}).get("error", "手机无响应")
             msg = f"解锁失败：{err}"
             return {"summary": msg, "is_error": True, "error": msg}
+        finally:
+            self._lock_gate.release()
 
     async def _do_lock_pc(self, reason: str, manual: bool = False) -> tuple[bool, str]:
         """返回 (ok, 给 LLM 的话)。阻塞调用全部丢到线程里，避免卡事件循环。"""
         cooldown = self._int_cfg("lock_cooldown_sec", 180)
         limit = self._int_cfg("lock_daily_limit", 5)
-        async with self._lock_gate:
+        try:
+            await asyncio.wait_for(self._lock_gate.acquire(), timeout=3.0)
+        except asyncio.TimeoutError:
+            return False, "另一个锁机操作还在进行，请过几秒再试。"
+        try:
             if await asyncio.to_thread(self._pc_lock_alive):
                 return True, "电脑已经在锁定状态了。" + (f"原因：{reason}" if reason else "")
             if not manual:
@@ -304,8 +331,9 @@ class YuiLockPlugin(NekoPluginBase):
                 return False, "找不到 pc_locker.py，无法锁定电脑。"
             allow = [sys.executable] + [str(p) for p in (self._cfg.get("pc_allow") or [])]
             ttl = max(0, self._int_cfg("pc_lock_ttl", 300))
+            force = bool(self._cfg.get("pc_force_kill", False))
             r = await asyncio.to_thread(pclock.spawn_locker, script,
-                                        allow_exes=allow, ttl_sec=ttl)
+                                        allow_exes=allow, ttl_sec=ttl, force_kill=force)
             if r.get("ok"):
                 if not manual:
                     self.guard.record("pc")
@@ -313,10 +341,18 @@ class YuiLockPlugin(NekoPluginBase):
                 return True, ("电脑已锁定：主人打开的任何程序都会被立即弹回桌面（N.E.K.O. 不受影响）"
                               + note + (f"。原因：{reason}" if reason else ""))
             return False, f"锁定电脑失败：{r.get('error')}"
+        finally:
+            self._lock_gate.release()
 
     async def _do_unlock_pc(self, reason: str) -> tuple[bool, str]:
-        async with self._lock_gate:
+        try:
+            await asyncio.wait_for(self._lock_gate.acquire(), timeout=3.0)
+        except asyncio.TimeoutError:
+            return False, "另一个锁机操作还在进行，请过几秒再试。"
+        try:
             status, msg = await asyncio.to_thread(pclock.kill_locker)
+        finally:
+            self._lock_gate.release()
         ok = status in pclock.UNLOCK_OK_STATES
         out = (msg if ok else f"解锁失败：{msg}") + "。"
         if reason:
@@ -436,7 +472,8 @@ class YuiLockPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {}})
     async def lock_phone_now(self, **_):
         try:
-            return Ok(await self._do_lock_phone("screen", "", manual=True))
+            r = await self._do_lock_phone("screen", "", manual=True)
+            return Err(r["summary"]) if r.get("is_error") else Ok(r)
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 
@@ -448,7 +485,8 @@ class YuiLockPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {}})
     async def lock_phone_apps_now(self, **_):
         try:
-            return Ok(await self._do_lock_phone("apps", "", manual=True))
+            r = await self._do_lock_phone("apps", "", manual=True)
+            return Err(r["summary"]) if r.get("is_error") else Ok(r)
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 
@@ -459,7 +497,8 @@ class YuiLockPlugin(NekoPluginBase):
                   input_schema={"type": "object", "properties": {}})
     async def unlock_phone_now(self, **_):
         try:
-            return Ok(await self._do_unlock_phone(""))
+            r = await self._do_unlock_phone("")
+            return Err(r["summary"]) if r.get("is_error") else Ok(r)
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 

@@ -17,11 +17,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
 import time
 from pathlib import Path
+
+_LOG = logging.getLogger(__name__)
 
 
 def _state_dir() -> Path:
@@ -64,7 +67,9 @@ class LockGuard:
             tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, self.path)   # 原子替换：不会留下半截文件
-        except Exception:
+        except Exception as exc:
+            # 写不进去要说出来：否则每日上限和到期记录会静默丢失
+            _LOG.warning("guard 状态写入失败：%s", exc)
             if tmp is not None:
                 try:
                     tmp.unlink()

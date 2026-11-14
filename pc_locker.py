@@ -62,9 +62,20 @@ ARGS.add_argument("--allow", action="append", default=[],
                   help="额外放行的程序完整路径（如 N.E.K.O. 的 python.exe）")
 ARGS.add_argument("--ttl", type=int, default=0,
                   help="自动解锁时间（秒）；0=不自动解锁，等插件/秘密按键/重启解除")
+ARGS.add_argument("--force-kill", action="store_true",
+                  help="允许在 WM_CLOSE 无效时 taskkill /F（默认关闭，避免误杀未保存的文档）")
 OPTS = ARGS.parse_args()
 
 SELF_PATH = os.path.abspath(sys.executable).lower()
+# venv 的 pythonw.exe 只是转发启动器：sys.executable 与当前进程真实映像可能不同，
+# 两者都要认，否则 watchdog 会把自己的 banner 当成「外部程序」关掉。
+CURRENT_PID = os.getpid()
+try:
+    _img = ctypes.create_unicode_buffer(1024)
+    kernel32.GetModuleFileNameW(None, _img, 1024)
+    CURRENT_IMAGE = _img.value.lower()
+except Exception:
+    CURRENT_IMAGE = ""
 ALLOW_PATHS = {os.path.abspath(p).lower() for p in OPTS.allow}
 # 系统外壳白名单：只认「完整路径」，保留扩展名与点号，不做任何名字折叠
 SYSTEM_ROOT = os.environ.get("SystemRoot", r"C:\Windows").lower()
@@ -119,7 +130,7 @@ def exe_path(pid: int) -> str:
 
 
 def allowed_pid(pid: int) -> bool:
-    if pid in (0, 4):
+    if pid in (0, 4) or pid == CURRENT_PID:
         return True
     path = exe_path(pid)
     # 查不到路径（权限不足等）一律拒绝放行，宁可错关不可放过未知进程
@@ -128,6 +139,8 @@ def allowed_pid(pid: int) -> bool:
     lp = path.lower()
     # 显式 exe 路径列表（不信任整个目录）
     if lp == SELF_PATH or lp in ALLOW_PATHS:
+        return True
+    if CURRENT_IMAGE and lp == CURRENT_IMAGE:
         return True
     # 系统外壳：只放行 %SystemRoot% 下固定位置的完整路径（SystemApps 包前缀 + 主名白名单）
     return is_shell_path(lp)
@@ -183,7 +196,8 @@ def watchdog() -> None:
                         pass
                     user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
                     # 连续 ~1.6 秒都不肯关，才强杀；且整场锁定最多 5 次
-                    if hits.get(p, 0) >= 8 and force_kills < MAX_FORCE_KILLS:
+                    if (OPTS.force_kill and hits.get(p, 0) >= 8
+                            and force_kills < MAX_FORCE_KILLS):
                         subprocess.run(["taskkill", "/F", "/PID", str(p)],
                                        capture_output=True, creationflags=CREATE_NO_WINDOW)
                         force_kills += 1
@@ -241,11 +255,12 @@ def hook_thread() -> None:
         user32.UnhookWindowsHookEx(hook)
 
 
-def banner() -> None:
+def banner() -> bool:
+    """在主线程里跑 Tk（子线程建 Tk 不稳定）；返回 False 表示起不来。"""
     try:
         import tkinter as tk
     except Exception:
-        return
+        return False
     try:
         root = tk.Tk()
         root.overrideredirect(True)
@@ -256,9 +271,19 @@ def banner() -> None:
         root.geometry(f"{w}x{h}+{max(sw - w - 20, 0)}+20")
         tk.Label(root, text="🔒 已锁定", font=("Microsoft YaHei UI", 16, "bold"),
                  fg="white", bg="#E8536B").pack(expand=True, fill="both")
+        deadline = time.time() + OPTS.ttl if OPTS.ttl > 0 else 0.0
+
+        def poll() -> None:
+            if state["unlocked"] or (deadline and time.time() >= deadline):
+                root.destroy()
+                return
+            root.after(200, poll)
+
+        poll()
         root.mainloop()
+        return True
     except Exception:
-        pass
+        return False
 
 
 def main() -> None:
@@ -266,15 +291,16 @@ def main() -> None:
     minimize_all()
     threading.Thread(target=hook_thread, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
-    threading.Thread(target=banner, daemon=True).start()
-    deadline = time.time() + OPTS.ttl if OPTS.ttl > 0 else 0.0
-    try:
-        while not state["unlocked"]:
-            if deadline and time.time() >= deadline:
-                break
-            time.sleep(0.25)
-    except KeyboardInterrupt:
-        pass
+    if not banner():
+        # 没有可用的 Tk 时才退回轮询（不要在主线程之外建 Tk）
+        deadline = time.time() + OPTS.ttl if OPTS.ttl > 0 else 0.0
+        try:
+            while not state["unlocked"]:
+                if deadline and time.time() >= deadline:
+                    break
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            pass
     clear_state()
 
 

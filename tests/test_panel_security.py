@@ -68,9 +68,10 @@ class TestSessionToken(unittest.TestCase):
     def test_post_headers_include_session(self):
         self.assertIn("X-YuiLock-Session", panel.PAGE)
 
-    def test_qr_image_carries_session(self):
-        # 二维码带明文令牌，必须凭会话拿，不能裸奔给本机任意进程
-        self.assertIn("/qr.png?s=__SESSION__", panel.PAGE)
+    def test_qr_fetches_with_session_header(self):
+        # 二维码带明文令牌：改用会话头按需获取，令牌不再出现在 URL 里
+        self.assertIn("fetch('/qr.png', {headers: {'X-YuiLock-Session': SESSION}})", panel.PAGE)
+        self.assertNotIn("/qr.png?s=", panel.PAGE)
 
     def test_status_fetch_sends_session(self):
         self.assertIn("'/api/status',{headers:{'X-YuiLock-Session':SESSION}}", panel.PAGE)

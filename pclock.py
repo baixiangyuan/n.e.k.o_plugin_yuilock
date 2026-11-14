@@ -260,11 +260,37 @@ def is_locker_alive() -> bool:
     return _state_verdict(st) is not False
 
 
+def _ancestor_exes(pid: int | None = None) -> list[str]:
+    """沿父进程链取可执行文件路径：放行宿主（N.E.K.O. 前端/后端），避免锁机时误关。"""
+    if sys.platform != "win32":
+        return []
+    try:
+        start = int(pid or os.getpid())
+        script = (
+            f"$p={start}; $r=@(); "
+            "for($i=0;$i -lt 8;$i++){"
+            "$x=Get-CimInstance Win32_Process -Filter \"ProcessId=$p\"; "
+            "if(-not $x){break}; "
+            "if($x.ExecutablePath){$r+=$x.ExecutablePath}; "
+            "$p=$x.ParentProcessId; "
+            "if($p -le 4){break}}; "
+            "$r -join \"`n\""
+        )
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, text=True, timeout=12,
+                             creationflags=CREATE_NO_WINDOW)
+        return [line.strip() for line in (out.stdout or "").splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
 def spawn_locker(script: Path, allow_exes: list[str] | None = None,
-                 ttl_sec: int = 0) -> dict:
+                 ttl_sec: int = 0, force_kill: bool = False) -> dict:
     """启动锁机进程。ttl_sec>0 时锁机进程到点自行退出（插件崩溃也能解除）。"""
     if sys.platform != "win32":
         return {"ok": False, "error": "锁定电脑仅支持 Windows"}
+    # 先取祖先进程（可能跑一次 PowerShell），不要占着文件锁
+    ancestors = _ancestor_exes()
     try:
         with _FileLock():
             if is_locker_alive():
@@ -276,16 +302,30 @@ def spawn_locker(script: Path, allow_exes: list[str] | None = None,
             args = [exe, str(script), "--instance", instance, "--state", str(STATE_PATH)]
             if ttl_sec > 0:
                 args += ["--ttl", str(int(ttl_sec))]
-            for p in (allow_exes or []):
-                args += ["--allow", str(p)]
+            if force_kill:
+                args += ["--force-kill"]
+            allow_list = [str(p) for p in (allow_exes or [])]
+            for p in ancestors:
+                if p not in allow_list:
+                    allow_list.append(p)
+            for p in allow_list:
+                args += ["--allow", p]
             try:
                 proc = subprocess.Popen(args, creationflags=CREATE_NO_WINDOW,
                                         cwd=str(script.parent))
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
-            STATE_PATH.write_text(json.dumps(
-                {"pid": proc.pid, "instance": instance, "exe": exe.lower()}),
-                encoding="utf-8")
+            try:
+                STATE_PATH.write_text(json.dumps(
+                    {"pid": proc.pid, "instance": instance, "exe": exe.lower()}),
+                    encoding="utf-8")
+            except Exception as exc:
+                # 状态写不进去就不要让锁机进程继续跑：否则插件再也找不到它
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return {"ok": False, "error": f"写入锁机状态失败，已结束刚启动的进程：{exc}"}
             return {"ok": True, "pid": proc.pid, "instance": instance}
     except TimeoutError as exc:
         return {"ok": False, "error": str(exc)}
@@ -323,7 +363,8 @@ def kill_locker() -> tuple[str, str]:
             pid = int(st["pid"])
             if sys.platform == "win32":
                 try:
-                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                    # /T：venv 的 pythonw.exe 只是转发启动器，真正的锁机进程是它的子进程
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
                                    capture_output=True, timeout=15,
                                    creationflags=CREATE_NO_WINDOW)
                 except Exception as exc:
