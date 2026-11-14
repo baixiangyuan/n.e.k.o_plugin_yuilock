@@ -21,23 +21,35 @@ LOCK_PATH = Path(tempfile.gettempdir()) / "yuilock_pc_lock.lock"
 
 
 class _FileLock:
-    """Windows 文件锁（msvcrt）：包住「检查是否已锁 → 启动 → 写状态」全程，防并发双开。"""
+    """文件锁：包住「检查是否已锁 → 启动 → 写状态」全程，防并发双开。
+
+    Windows 用 msvcrt，其它平台用 fcntl。CI（Linux）会 import 本模块，
+    所以不能无条件 import msvcrt。"""
+    _IS_WIN = sys.platform == "win32"
 
     def __enter__(self):
         self._fp = open(LOCK_PATH, "a+b")
         try:
-            import msvcrt
-            msvcrt.locking(self._fp.fileno(), msvcrt.LK_LOCK, 1)
-        except OSError:
+            if self._IS_WIN:
+                import msvcrt
+                msvcrt.locking(self._fp.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
+        except (OSError, ImportError):
             pass  # 拿不到锁也继续（尽力互斥）
         return self
 
     def __exit__(self, *exc):
         try:
             self._fp.seek(0)
-            import msvcrt
-            msvcrt.locking(self._fp.fileno(), msvcrt.LK_UNLCK, 1)
-        except OSError:
+            if self._IS_WIN:
+                import msvcrt
+                msvcrt.locking(self._fp.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
+        except (OSError, ImportError):
             pass
         self._fp.close()
         return False
