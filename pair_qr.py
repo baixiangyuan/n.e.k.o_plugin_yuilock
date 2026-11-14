@@ -6,8 +6,8 @@
 或已安装依赖时：
     python pair_qr.py [--host 局域网IP] [--port 48912] [--token 令牌] [--save]
 
-- 配置里 token 为空时会随机生成一个，并自动写回 plugin.toml 的 [yuilock] token
-  （默认只显示不写回；加 --save 才写回 plugin.toml，写回后点「重载」生效）。
+- 配置里 token 为空时会随机生成一个（24 位）。默认只显示、不写回；
+  加 --save 才写回 plugin.toml 的 [yuilock] token，写回后点「重载」生效。
 - 二维码图片保存在系统临时目录（不落在插件目录里，避免令牌被一起提交/分享）。
 """
 from __future__ import annotations

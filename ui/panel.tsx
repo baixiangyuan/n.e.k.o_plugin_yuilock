@@ -56,6 +56,33 @@ export default function YuiLockPanel(props: PluginSurfaceProps) {
 
   const refreshingRef = useRef(false)
   const unmountedRef = useRef(false)
+  const [qr, setQr] = useState<{ uri: string; img: string } | null>(null)
+  const [qrLoading, setQrLoading] = useState(false)
+  const qrTimerRef = useRef<number | null>(null)
+
+  // 二维码含明文令牌：只有用户点击后才调用 pair_qr_live 在本地生成，5 分钟后自动隐藏
+  const showQr = async () => {
+    if (qrLoading) return
+    setQrLoading(true)
+    try {
+      const envelope = await props.api.call("pair_qr_live")
+      const data = unwrapActionResult(envelope)
+      if (data.is_error || !data.qr_data_url) {
+        setStatus((prev) => ({
+          ...prev,
+          error: String(data.summary || data.error || "二维码生成失败"),
+        }))
+        return
+      }
+      setQr({ uri: String(data.pair_uri || ""), img: String(data.qr_data_url) })
+      if (qrTimerRef.current) window.clearTimeout(qrTimerRef.current)
+      qrTimerRef.current = window.setTimeout(() => setQr(null), 5 * 60 * 1000)
+    } catch (exc: any) {
+      setStatus((prev) => ({ ...prev, error: String(exc?.message || exc) }))
+    } finally {
+      setQrLoading(false)
+    }
+  }
 
   const refresh = async () => {
     if (refreshingRef.current || unmountedRef.current) return
@@ -93,12 +120,12 @@ export default function YuiLockPanel(props: PluginSurfaceProps) {
     return () => {
       unmountedRef.current = true
       window.clearInterval(timer)
+      if (qrTimerRef.current) window.clearTimeout(qrTimerRef.current)
     }
   }, [])
 
   const pcLocked = Boolean(state.pc_lock)
   const tokenSet = Boolean(state.token_set)
-  const pairUri = String(state.pair_uri || "")
 
   const statusItems = status.summary
     ? [{ key: "summary", label: "状态", value: status.summary }]
@@ -132,24 +159,32 @@ export default function YuiLockPanel(props: PluginSurfaceProps) {
 
       <Card title="配对二维码">
         <Stack>
-          {state.qr_data_url ? (
+          {qr ? (
             <img
-              src={String(state.qr_data_url)}
+              src={qr.img}
               alt="Yui Lock 配对二维码"
               style={{ width: "220px", height: "220px", background: "#fff", borderRadius: "10px" }}
             />
           ) : (
             <Tip>
-              二维码生成需要 qrcode 库：在 N.E.K.O. 的 Python 环境安装
-              `pip install qrcode pillow`，或电脑上运行 `uv run --with qrcode --with pillow python pair_qr.py`。
+              二维码含明文令牌，默认不显示。点击按钮后在本地生成，5 分钟后自动隐藏。
+              生成需要 qrcode 库：`pip install qrcode pillow`。
             </Tip>
           )}
+          <Button onClick={showQr} disabled={qrLoading}>
+            {qr ? "重新生成二维码" : "显示配对二维码"}
+          </Button>
+          {qr ? <Text>配对码：{qr.uri}</Text> : null}
+          {state.host_ok === false ? (
+            <Alert tone="warning">
+              没探测到局域网 IP：请在 plugin.toml 的 [yuilock] 里把 host 填成电脑的局域网地址。
+            </Alert>
+          ) : null}
           <Text>
-            手机打开 Yui Lock App → 点「扫码配对」→ 对准上面的二维码，端口和令牌自动填好。
+            手机打开 Yui Lock App → 点「扫码配对」→ 对准二维码，端口和令牌自动填好。
           </Text>
-          {pairUri ? <Text>配对码：{pairUri}</Text> : null}
           <Text>
-            局域网地址 {String(state.host || "?")}:{String(state.port || "?")} · 手机和电脑需同一 Wi-Fi（或蓝牙配对）。
+            局域网地址 {String(state.host || "（未探测到）")}:{String(state.port || "?")} · 手机和电脑需同一 Wi-Fi（或蓝牙配对）。
           </Text>
         </Stack>
       </Card>

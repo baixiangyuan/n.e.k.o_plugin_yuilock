@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import socket
 import tempfile
@@ -25,7 +26,19 @@ from typing import Any, Optional
 
 CONTROL_CMDS = {"lock", "applock", "unlock"}
 
-STATE_PATH = Path(tempfile.gettempdir()) / "yuilock_phone_ip.json"
+
+def _state_dir() -> Path:
+    """缓存放用户数据目录（%LOCALAPPDATA%\\yuilock），不放在全员可写的 %TEMP%。"""
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    d = Path(base) / "yuilock"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except Exception:
+        return Path(tempfile.gettempdir())
+
+
+STATE_PATH = _state_dir() / "phone_ip.json"
 
 
 def _auth_proof(token: str, cmd: str, nonce: str, challenge: str) -> str:

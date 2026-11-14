@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -17,8 +18,21 @@ import uuid
 from pathlib import Path
 
 CREATE_NO_WINDOW = 0x08000000
-STATE_PATH = Path(tempfile.gettempdir()) / "yuilock_pc_lock.json"
-LOCK_PATH = Path(tempfile.gettempdir()) / "yuilock_pc_lock.lock"
+
+
+def _state_dir() -> Path:
+    """状态放用户数据目录（%LOCALAPPDATA%\\yuilock），不放在全员可写的 %TEMP%。"""
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    d = Path(base) / "yuilock"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except Exception:
+        return Path(tempfile.gettempdir())
+
+
+STATE_PATH = _state_dir() / "pc_lock.json"
+LOCK_PATH = _state_dir() / "pc_lock.lock"
 
 
 class _FileLock:

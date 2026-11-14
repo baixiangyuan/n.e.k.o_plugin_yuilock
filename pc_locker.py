@@ -158,8 +158,15 @@ def minimize_all() -> None:
     user32.keybd_event(VK_LWIN, 0, 2, 0)
 
 
+SW_MINIMIZE = 6
+# 强杀上限：超过后只压窗口 / 发 WM_CLOSE，不再 /F。
+# 放弃「无限强杀」是刻意的——避免把没保存的文档一起杀掉。
+MAX_FORCE_KILLS = 5
+
+
 def watchdog() -> None:
     hits: dict[int, int] = {}
+    force_kills = 0
     while not state["unlocked"]:
         try:
             hwnd = user32.GetForegroundWindow()
@@ -169,13 +176,20 @@ def watchdog() -> None:
                 p = pid.value
                 if p and not allowed_pid(p):
                     hits[p] = hits.get(p, 0) + 1
+                    # 先礼后兵：最小化压回桌面 + 请求正常关闭
+                    try:
+                        user32.ShowWindow(hwnd, SW_MINIMIZE)
+                    except Exception:
+                        pass
                     user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-                    if hits.get(p, 0) >= 4:
-                        # 不肯自己关的，强杀
+                    # 连续 ~1.6 秒都不肯关，才强杀；且整场锁定最多 5 次
+                    if hits.get(p, 0) >= 8 and force_kills < MAX_FORCE_KILLS:
                         subprocess.run(["taskkill", "/F", "/PID", str(p)],
                                        capture_output=True, creationflags=CREATE_NO_WINDOW)
+                        force_kills += 1
+                        hits[p] = 0
             if len(hits) > 64:
-                hits = {k: v for k, v in hits.items() if v < 4}
+                hits = {k: v for k, v in hits.items() if v < 8}
             time.sleep(0.2)
         except Exception:
             time.sleep(0.5)

@@ -23,7 +23,18 @@ import threading
 import time
 from pathlib import Path
 
-STATE_PATH = Path(tempfile.gettempdir()) / "yuilock_guard.json"
+def _state_dir() -> Path:
+    """状态放用户数据目录（%LOCALAPPDATA%\\yuilock），不放在全员可写的 %TEMP%。"""
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    d = Path(base) / "yuilock"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except Exception:
+        return Path(tempfile.gettempdir())
+
+
+STATE_PATH = _state_dir() / "guard.json"
 _STATE_LOCK = threading.Lock()
 
 
@@ -70,26 +81,29 @@ class LockGuard:
         mono = self._mono()
         with _STATE_LOCK:
             data = self._load()
+        # 冷却先判，且不看日期：否则跨零点就能立刻再锁一次
+        if cooldown_sec > 0:
+            # 优先用本进程的 monotonic：即使把系统时间往前调也绕不过冷却
+            if kind in self._last_mono:
+                elapsed = max(0.0, mono - self._last_mono[kind])
+            else:
+                last = float((data.get("last_ts") or {}).get(kind, 0) or 0)
+                if last > 0:
+                    elapsed = max(0.0, now - last)
+                else:
+                    elapsed = None
+            if elapsed is not None:
+                left = cooldown_sec - elapsed
+                if left > 0:
+                    return (f"刚刚才锁过{'手机' if kind == 'phone' else '电脑'}，"
+                            f"冷却中（还剩 {int(left) + 1} 秒），不能连续锁。")
+        # 每日次数按自然日重置
         if data.get("date") != self._today(now):
             return None
         count = int(data.get("count", 0) or 0)
         if daily_limit > 0 and count >= daily_limit:
             return (f"今天已经锁过 {count} 次了（上限 {daily_limit} 次），"
                     f"先冷静一下，不能再锁了。")
-        if cooldown_sec <= 0:
-            return None
-        # 优先用本进程的 monotonic：即使把系统时间往前调也绕不过冷却
-        if kind in self._last_mono:
-            elapsed = max(0.0, mono - self._last_mono[kind])
-        else:
-            last = float((data.get("last_ts") or {}).get(kind, 0) or 0)
-            if last <= 0:
-                return None
-            elapsed = max(0.0, now - last)
-        left = cooldown_sec - elapsed
-        if left > 0:
-            return (f"刚刚才锁过{'手机' if kind == 'phone' else '电脑'}，"
-                    f"冷却中（还剩 {int(left) + 1} 秒），不能连续锁。")
         return None
 
     def record(self, kind: str) -> None:

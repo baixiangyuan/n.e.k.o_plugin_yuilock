@@ -39,7 +39,9 @@ from . import pclock
 from .client import YuiLockClient
 from .guard import LockGuard
 
-TOOL_TIMEOUT = 15.0
+# 必须大于 client.send 的最坏耗时（timeout*2+4 = 20s），否则工具先超时、
+# 手机已经执行了但插件没来得及记账/登记到期时间。
+TOOL_TIMEOUT = 25.0
 
 REASON_NOTE = {
     "type": "object",
@@ -123,22 +125,48 @@ class YuiLockPlugin(NekoPluginBase):
 
     @staticmethod
     def _lan_ip() -> str:
+        """探测局域网 IP；失败返回空串（不要回退 127.0.0.1——那生成的二维码是废的）。"""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             s.connect(("223.5.5.5", 80))
-            return s.getsockname()[0]
+            ip = s.getsockname()[0]
+            return "" if ip.startswith("127.") else ip
         except Exception:
-            return "127.0.0.1"
+            return ""
         finally:
             s.close()
 
-    def _pair_info(self) -> dict:
-        """面板用配对信息：pair URI + 二维码 PNG（data URL，qrcode 库可选）。"""
+    def _pair_host(self) -> str:
         host = str(self._cfg.get("host", "auto") or "auto")
         if host in ("", "auto", "none"):
             host = self._lan_ip()
+        return host
+
+    def _pair_info(self) -> dict:
+        """面板默认上下文：只有状态，**不下发含令牌的 URI / 二维码**。"""
+        host = self._pair_host()
+        token = str(self._cfg.get("token", "") or "")
+        return {
+            "pair_uri": "",
+            "qr_data_url": None,
+            "host": host,
+            "host_ok": bool(host) and not host.startswith("127."),
+            "port": int(self._cfg.get("port", 48912) or 48912),
+            "token_set": bool(token),
+            "pc_lock": pclock.is_locker_alive(),
+        }
+
+    def _pair_payload(self) -> dict:
+        """显式点击「显示配对二维码」时才生成：URI 与二维码都含明文令牌。"""
+        host = self._pair_host()
         port = int(self._cfg.get("port", 48912) or 48912)
         token = str(self._cfg.get("token", "") or "")
+        if not host or host.startswith("127."):
+            return {"summary": "没探测到局域网 IP：请在 plugin.toml 的 [yuilock] 里把 "
+                               "host 填成电脑的局域网地址后再试。", "is_error": True}
+        if not token:
+            return {"summary": "还没有设置配对令牌：先运行 pair_qr.py 生成并写入 token。",
+                    "is_error": True}
         uri = f"yuilock://pair?h={host}&p={port}&t={token}"
         qr = None
         try:
@@ -153,12 +181,9 @@ class YuiLockPlugin(NekoPluginBase):
         except Exception:
             qr = None
         return {
+            "summary": "配对二维码已生成（含明文令牌，请勿截图外发）",
             "pair_uri": uri,
             "qr_data_url": qr,
-            "host": host,
-            "port": port,
-            "token_set": bool(token),
-            "pc_lock": pclock.is_locker_alive(),
         }
 
     @ui.context(id="dashboard", title="Yui Lock")
@@ -388,6 +413,18 @@ class YuiLockPlugin(NekoPluginBase):
                 s = f"手机：不在线（{(p or {}).get('error', '无响应')}）；电脑锁：{'开' if pc else '关'}"
             # phone_online 单独成字段：面板只根据它上色，RPC 成功 ≠ 手机在线
             return Ok({"summary": s, "phone_online": online})
+        except Exception as exc:
+            return Err(f"{type(exc).__name__}: {exc}")
+
+    @ui.action(id="pair_qr_live", label="显示配对二维码", tone="default", group="配对",
+               confirm="二维码里含明文配对令牌，请勿截图外发。确定显示？")
+    @plugin_entry(id="pair_qr_live", name="显示配对二维码",
+                  description="点击后生成含令牌的配对二维码（默认不随面板下发）。",
+                  llm_result_fields=["summary"],
+                  input_schema={"type": "object", "properties": {}})
+    async def pair_qr_live(self, **_):
+        try:
+            return Ok(self._pair_payload())
         except Exception as exc:
             return Err(f"{type(exc).__name__}: {exc}")
 

@@ -62,6 +62,14 @@ class TestCooldown(unittest.TestCase):
         self.clock.advance(181)
         self.assertIsNone(self.g.check("phone", 180, 5))
 
+    def test_cross_midnight_cooldown_still_applies(self):
+        import time as _time
+        self.clock.now = _time.mktime((2026, 1, 1, 23, 59, 50, 0, 0, -1))
+        self.g.record("phone")
+        self.clock.advance(20)  # 次日 00:00:10，日期变了
+        msg = self.g.check("phone", 180, 5)
+        self.assertIsNotNone(msg, "跨零点不能绕过冷却")
+
     def test_zero_cooldown_disables_rule(self):
         self.g.record("phone")
         self.assertIsNone(self.g.check("phone", 0, 5))
