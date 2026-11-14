@@ -18,12 +18,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-from urllib.parse import quote
 import socket
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from plugin.sdk.plugin import (
     Err,
