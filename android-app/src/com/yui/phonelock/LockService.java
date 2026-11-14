@@ -24,6 +24,7 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.provider.Settings;
+import android.telecom.TelecomManager;
 
 import org.json.JSONObject;
 
@@ -70,6 +71,9 @@ public class LockService extends Service implements CommandHandler.Host {
     private static final int POOL_QUEUE_CAPACITY = 8;
     private static final int MAX_COMMANDS_PER_CONNECTION = 30;
     private static final long SESSION_MAX_MS = 60_000;
+    // 应用锁的自动解除上限由手机自己说了算：对端传 0 或超大值都不可能变成永久锁
+    private static final int APP_TTL_DEFAULT_SEC = 600;
+    private static final int APP_TTL_MAX_SEC = 3600;
     public static final String SPP_UUID_STR = "00001101-0000-1000-8000-00805F9B34FB";
 
     public static volatile boolean running = false;
@@ -109,6 +113,31 @@ public class LockService extends Service implements CommandHandler.Host {
         whitelist = new HashSet<>();
         whitelist.add(getPackageName());
         whitelist.add("com.android.systemui");
+        // 电话/紧急呼叫永远放行：应用锁不能挡拨号，否则紧急情况下会要命。
+        // 主流厂商包名 + 系统默认拨号器（OEM 定制也能覆盖到）。
+        whitelist.add("com.android.dialer");
+        whitelist.add("com.google.android.dialer");
+        whitelist.add("com.android.phone");
+        whitelist.add("com.android.server.telecom");
+        whitelist.add("com.android.incallui");
+        whitelist.add("com.android.emergency");
+        whitelist.add("com.android.contacts");
+        try {
+            TelecomManager tm = (TelecomManager) getSystemService(TELECOM_SERVICE);
+            if (tm != null) {
+                String dialer = null;
+                if (Build.VERSION.SDK_INT >= 29) {
+                    dialer = tm.getSystemDialerPackage();
+                }
+                if (dialer == null) {
+                    dialer = tm.getDefaultDialerPackage();
+                }
+                if (dialer != null && !dialer.isEmpty()) {
+                    whitelist.add(dialer);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
         try {
             Intent home = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
             ResolveInfo ri = getPackageManager().resolveActivity(home, PackageManager.MATCH_DEFAULT_ONLY);
@@ -473,7 +502,10 @@ public class LockService extends Service implements CommandHandler.Host {
                 lastEvent = "应用锁开启失败：缺少「显示悬浮窗」权限（Android 10+ 拦截必需）";
                 return false;
             }
-            long until = ttlSec > 0 ? System.currentTimeMillis() + ttlSec * 1000L : 0L;
+            // 手机端自己定上限：对端传 0 或超大值都不能变成「永久锁」
+            int effTtl = ttlSec <= 0 ? APP_TTL_DEFAULT_SEC
+                    : Math.min(ttlSec, APP_TTL_MAX_SEC);
+            long until = System.currentTimeMillis() + effTtl * 1000L;
             android.content.SharedPreferences.Editor ed =
                     prefs.edit().putBoolean("applock_active", true);
             if (until > 0) {
@@ -483,9 +515,7 @@ public class LockService extends Service implements CommandHandler.Host {
             }
             ed.apply();
             startAppLock();
-            lastEvent = ttlSec > 0
-                    ? ("应用锁已开启（" + (ttlSec / 60) + " 分钟后自动解除）")
-                    : "应用锁已开启";
+            lastEvent = "应用锁已开启（" + (effTtl / 60) + " 分钟后自动解除）";
             return true;
         }
         prefs.edit().putBoolean("applock_active", false).remove("applock_until").apply();
@@ -531,6 +561,15 @@ public class LockService extends Service implements CommandHandler.Host {
                             appLockRunning = false;
                             lastEvent = "应用锁已到期，自动解除";
                             return;
+                        }
+                        // 通话中绝不拦截：紧急呼叫/接听电话优先于任何惩罚
+                        try {
+                            TelecomManager tm = (TelecomManager) getSystemService(TELECOM_SERVICE);
+                            if (tm != null && tm.isInCall()) {
+                                Thread.sleep(200);
+                                continue;
+                            }
+                        } catch (Throwable ignored) {
                         }
                         // 悬浮窗权限被中途收回也视为失败
                         if (!Settings.canDrawOverlays(this)) {

@@ -51,15 +51,84 @@ def _read_state() -> dict | None:
         return None
 
 
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", ctypes.c_ushort),
+                ("MaximumLength", ctypes.c_ushort),
+                ("Buffer", ctypes.c_void_p)]
+
+
+class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [("Reserved1", ctypes.c_void_p),
+                ("PebBaseAddress", ctypes.c_void_p),
+                ("Reserved2", ctypes.c_void_p * 2),
+                ("UniqueProcessId", ctypes.c_void_p),
+                ("Reserved3", ctypes.c_void_p)]
+
+
+def _read_ptr(handle, address: int) -> int | None:
+    k32 = ctypes.WinDLL("kernel32")
+    buf = ctypes.c_void_p()
+    got = ctypes.c_size_t()
+    ok = k32.ReadProcessMemory(handle, ctypes.c_void_p(address),
+                               ctypes.byref(buf), ctypes.sizeof(buf), ctypes.byref(got))
+    return buf.value if ok else None
+
+
+def _win_process_cmdline_ctypes(pid: int) -> str:
+    """直接读 PEB 里的命令行（不依赖 PowerShell，不受其超时/输出编码影响）。
+    读不到返回空串，由调用方按「未知」处理，绝不据此下结论。"""
+    if sys.platform != "win32":
+        return ""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_VM_READ = 0x0010
+    k32 = ctypes.WinDLL("kernel32")
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, int(pid))
+    if not handle:
+        return ""
+    try:
+        ntdll = ctypes.WinDLL("ntdll")
+        pbi = _PROCESS_BASIC_INFORMATION()
+        ret = ctypes.c_ulong()
+        status = ntdll.NtQueryInformationProcess(
+            handle, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), ctypes.byref(ret))
+        if status != 0 or not pbi.PebBaseAddress:
+            return ""
+        is64 = ctypes.sizeof(ctypes.c_void_p) == 8
+        pp_offset = 0x20 if is64 else 0x10       # PEB.ProcessParameters
+        cmd_offset = 0x70 if is64 else 0x40      # RTL_USER_PROCESS_PARAMETERS.CommandLine
+        pp = _read_ptr(handle, pbi.PebBaseAddress + pp_offset)
+        if not pp:
+            return ""
+        us = _UNICODE_STRING()
+        got = ctypes.c_size_t()
+        if not k32.ReadProcessMemory(handle, ctypes.c_void_p(pp + cmd_offset),
+                                     ctypes.byref(us), ctypes.sizeof(us), ctypes.byref(got)):
+            return ""
+        if not us.Length or not us.Buffer:
+            return ""
+        buf = ctypes.create_unicode_buffer(us.Length // 2 + 1)
+        if not k32.ReadProcessMemory(handle, ctypes.c_void_p(us.Buffer), buf,
+                                     us.Length, ctypes.byref(got)):
+            return ""
+        return buf.value
+    except Exception:
+        return ""
+    finally:
+        k32.CloseHandle(handle)
+
+
 def _win_process_cmdline(pid: int) -> str:
+    """兜底：ctypes 读不到时再问 WMI。超时/失败一律返回空串。"""
     if sys.platform != "win32":
         return ""
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=15,
             creationflags=CREATE_NO_WINDOW)
+        if out.returncode != 0:
+            return ""
         return (out.stdout or "").strip()
     except Exception:
         return ""
@@ -87,19 +156,31 @@ def _win_process_path(pid: int) -> str:
         return ""
 
 
-def is_locker_alive() -> bool:
-    st = _read_state()
-    if not st:
+def _pid_alive(pid: int) -> bool:
+    if sys.platform != "win32":
         return False
-    return _state_matches_process(st)
+    try:
+        k32 = ctypes.WinDLL("kernel32")
+        h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return code.value == 259  # STILL_ACTIVE
+            return True
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
 
 
-def _state_matches_process(st: dict) -> bool:
-    """状态文件必须与真实进程三重对上：
-    1) 可执行文件路径 == 启动时记录的路径；
-    2) 命令行里有完整的「--instance <本次 uuid>」参数对；
-    3) pid 存活（以上查询本身即验证）。
-    状态文件损坏（pid 非整数等）一律返回 False，绝不抛错。"""
+def _state_verdict(st: dict) -> bool | None:
+    """三重校验，返回三态而不是布尔：
+    True  = 确认是本次锁机进程；
+    False = 确认不是（进程已退出 / PID 被复用 / 状态文件无效）；
+    None  = 无法判断（进程信息读不到，例如权限或瞬时失败）。
+    三态的意义：无法判断时绝不能当成「已退出」去清状态，否则会留下一个杀不掉的锁。"""
     try:
         pid = int(st.get("pid"))
     except (TypeError, ValueError):
@@ -108,14 +189,35 @@ def _state_matches_process(st: dict) -> bool:
     exe = str(st.get("exe", "")).strip().lower()
     if not instance or not exe:
         return False
-    path = _win_process_path(pid).lower()
-    if not path or path != exe:
+    if not _pid_alive(pid):
         return False
-    args = _win_process_cmdline(pid).split()
-    for i, a in enumerate(args):
-        if a == "--instance" and i + 1 < len(args) and args[i + 1].strip() == instance:
+    path = _win_process_path(pid).lower()
+    if not path:
+        return None
+    if path != exe:
+        return False
+    args = _win_process_cmdline_ctypes(pid)
+    if not args:
+        args = _win_process_cmdline(pid)
+    if not args:
+        return None
+    parts = args.split()
+    for i, a in enumerate(parts):
+        if a == "--instance" and i + 1 < len(parts) and parts[i + 1].strip() == instance:
             return True
     return False
+
+
+def _state_matches_process(st: dict) -> bool:
+    return _state_verdict(st) is True
+
+
+def is_locker_alive() -> bool:
+    st = _read_state()
+    if not st:
+        return False
+    # 无法确认时按「还活着」处理：宁可拒绝二次锁定，也不双开锁机进程
+    return _state_verdict(st) is not False
 
 
 def spawn_locker(script: Path, allow_exes: list[str] | None = None,
@@ -148,13 +250,18 @@ def spawn_locker(script: Path, allow_exes: list[str] | None = None,
 
 def kill_locker() -> tuple[bool, str]:
     """结束锁机进程。返回 (是否确实结束过, 给用户看的消息)。
-    必须三重校验（路径/instance 参数对/pid 存活）全部通过才 taskkill，
-    状态文件被篡改或 PID 被复用时宁可不动手；坏状态文件按无效清理，不抛错。"""
+
+    关键：只有「确认不是本实例」才清状态；「无法确认」必须保留状态并报错。
+    否则一次 PowerShell/权限抖动就会把状态删掉，而锁还在跑——从此插件再也找不到它。"""
     with _FileLock():
         st = _read_state()
         if not st:
             return False, "电脑当前没有锁定"
-        if not _state_matches_process(st):
+        verdict = _state_verdict(st)
+        if verdict is None:
+            return False, ("无法确认锁机进程身份（读取进程信息失败），状态已保留、未结束任何进程；"
+                           "请重试，或用任务管理器结束 pythonw.exe")
+        if verdict is False:
             try:
                 STATE_PATH.unlink()
             except Exception:

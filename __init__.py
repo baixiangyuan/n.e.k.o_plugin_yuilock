@@ -209,7 +209,8 @@ class YuiLockPlugin(NekoPluginBase):
                 act = (f"手机应用锁已开启（{ttl // 60} 分钟后自动解除）："
                        f"打开任何 App 都会被立刻弹回桌面")
             else:
-                act = "手机应用锁已开启：打开任何 App 都会被立刻弹回桌面（重启手机可解除）"
+                # 不下发 ttl 时由手机端按默认 10 分钟执行，绝不是永久
+                act = "手机应用锁已开启（手机端默认 10 分钟后自动解除）：打开任何 App 都会被立刻弹回桌面"
         else:
             r = await self.client.lock_screen()
             act = "手机已熄屏锁屏（需要密码才能解锁）"

@@ -1,0 +1,73 @@
+"""web_panel 防 DNS rebinding / CSRF 的回归测试。
+
+历史问题：Host 用 startswith 判断，`127.0.0.1.evil.com` 也能通过；
+配合 DNS rebinding 就能读 /qr.png、POST 控制命令。
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_panel():
+    path = os.path.join(ROOT, "web_panel.py")
+    spec = importlib.util.spec_from_file_location("yuilock_web_panel", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+panel = load_panel()
+PORT = 48913
+
+
+class TestHostAllow(unittest.TestCase):
+    def test_exact_forms_allowed(self):
+        self.assertTrue(panel.host_allowed(f"127.0.0.1:{PORT}", PORT))
+        self.assertTrue(panel.host_allowed(f"LOCALHOST:{PORT}", PORT))
+
+    def test_rebinding_suffix_rejected(self):
+        for host in (f"127.0.0.1.evil.com:{PORT}",
+                     f"localhost.evil.com:{PORT}",
+                     f"127.0.0.1:{PORT}.evil.com",
+                     f"127.0.0.10:{PORT}",
+                     f"evil.com:{PORT}"):
+            self.assertFalse(panel.host_allowed(host, PORT), host)
+
+    def test_wrong_port_rejected(self):
+        self.assertFalse(panel.host_allowed("127.0.0.1:5000", PORT))
+
+    def test_empty_rejected(self):
+        self.assertFalse(panel.host_allowed("", PORT))
+
+
+class TestOriginAllow(unittest.TestCase):
+    def test_exact_origin_allowed(self):
+        self.assertTrue(panel.origin_allowed(f"http://127.0.0.1:{PORT}", PORT))
+        self.assertTrue(panel.origin_allowed(f"http://localhost:{PORT}", PORT))
+
+    def test_foreign_origin_rejected(self):
+        for origin in ("http://evil.com", f"http://127.0.0.1:{PORT}.evil.com",
+                       f"https://127.0.0.1:{PORT}", f"http://127.0.0.1:{PORT + 1}"):
+            self.assertFalse(panel.origin_allowed(origin, PORT), origin)
+
+    def test_missing_origin_rejected(self):
+        self.assertFalse(panel.origin_allowed("", PORT))
+
+
+class TestSessionToken(unittest.TestCase):
+    def test_session_is_random_and_long(self):
+        self.assertGreaterEqual(len(panel.SESSION), 24)
+
+    def test_page_embeds_session_placeholder(self):
+        self.assertIn("__SESSION__", panel.PAGE)
+
+    def test_post_headers_include_session(self):
+        self.assertIn("X-YuiLock-Session", panel.PAGE)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -93,7 +93,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "aapt2 compile failed" }
 
 "==> aapt2 link"
-& "$bt\aapt2.exe" link -o "$out\base.apk" -I $aj --manifest "$root\AndroidManifest.xml" -R "$out\res.zip" --java "$out\gen" --min-sdk-version 26 --target-sdk-version 34 --version-code 10 --version-name 1.7.0 --auto-add-overlay
+& "$bt\aapt2.exe" link -o "$out\base.apk" -I $aj --manifest "$root\AndroidManifest.xml" -R "$out\res.zip" --java "$out\gen" --min-sdk-version 26 --target-sdk-version 34 --version-code 11 --version-name 1.7.1 --auto-add-overlay
 if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 
 "==> javac"

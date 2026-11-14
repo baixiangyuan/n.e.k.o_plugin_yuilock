@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import secrets
 import socket
 import sys
 import tomllib
@@ -69,6 +71,11 @@ LAN_IP = detect_lan_ip()
 PAIR_URI = f"yuilock://pair?h={LAN_IP}&p={PORT}&t={TOKEN}"
 ALLOW_EXES = [sys.executable] + [str(p) for p in (CFG.get("pc_allow") or [])]
 
+# 每次启动生成的一次性会话令牌：嵌进页面脚本，POST 必须带上。
+# 就算 DNS rebinding 骗过了 Host，同源策略也让恶意页面读不到这个值。
+SESSION = secrets.token_urlsafe(24)
+MAX_BODY = 64 * 1024
+
 ACTIONS = {
     "lock_screen": lambda: CLIENT.lock_screen(),
     "lock_apps": lambda: CLIENT.lock_apps(),
@@ -83,7 +90,8 @@ def run_action(name: str) -> dict:
     if name == "lock_pc":
         if pclock.is_locker_alive():
             return {"ok": True, "message": "电脑已经处于锁定状态"}
-        r = pclock.spawn_locker(LOCKER, allow_exes=ALLOW_EXES)
+        # 面板锁电脑也强制到期：面板崩了/人走了也一定会自己解开
+        r = pclock.spawn_locker(LOCKER, allow_exes=ALLOW_EXES, ttl_sec=300)
         if r.get("ok"):
             return {"ok": True, "message": "电脑已锁定：打开任何程序都会被立即弹回桌面"}
         return {"ok": False, "message": f"锁定失败：{r.get('error')}"}
@@ -128,6 +136,7 @@ img{width:200px;height:200px;background:#fff;border-radius:10px}
 </div>
 <div id="msg"></div></div>
 <script>
+const SESSION = "__SESSION__";
 async function refresh(){
   try{const r=await fetch('/api/status');const j=await r.json();
   document.getElementById('status').textContent=j.text;}catch(e){
@@ -138,7 +147,7 @@ async function act(name){
   if(danger&&!confirm('确定执行「'+name+'」？'))return;
   document.getElementById('msg').textContent='执行中…';
   try{const r=await fetch('/api/action',{method:'POST',
-    headers:{'X-YuiLock-Panel':'1','Content-Type':'application/json'},
+    headers:{'X-YuiLock-Panel':'1','X-YuiLock-Session':SESSION,'Content-Type':'application/json'},
     body:JSON.stringify({action:name})});
   const j=await r.json();document.getElementById('msg').textContent=j.message||JSON.stringify(j);}
   catch(e){document.getElementById('msg').textContent='请求失败：'+e;}
@@ -148,12 +157,25 @@ refresh();setInterval(refresh,3000);
 </script></body></html>"""
 
 
+def host_allowed(host: str, port: int) -> bool:
+    """防 DNS rebinding：Host 必须精确等于 127.0.0.1:<port> 或 localhost:<port>。
+    不能用 startswith——127.0.0.1.evil.com 会通过。"""
+    return (host or "").strip().lower() in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+
+def origin_allowed(origin: str, port: int) -> bool:
+    """浏览器 POST 一定带 Origin；必须与面板自身的源完全一致。"""
+    return (origin or "").strip().lower() in (
+        f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def _host_ok(self) -> bool:
-        """防 DNS rebinding：Host 必须是 127.0.0.1 / localhost。"""
-        host = (self.headers.get("Host") or "").lower()
-        return host.startswith("127.0.0.1") or host.startswith("localhost")
+        return host_allowed(self.headers.get("Host") or "", self.server.server_address[1])
+
+    def _origin_ok(self) -> bool:
+        return origin_allowed(self.headers.get("Origin") or "", self.server.server_address[1])
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
@@ -172,7 +194,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, b"forbidden", "text/plain")
             return
         if self.path == "/":
-            self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            page = PAGE.replace("__SESSION__", SESSION)
+            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path == "/api/status":
             try:
                 p = asyncio.run(CLIENT.ping())
@@ -219,8 +242,18 @@ class Handler(BaseHTTPRequestHandler):
         if (self.headers.get("X-YuiLock-Panel") or "") != "1":
             self._send(403, b"forbidden", "text/plain")
             return
+        if not self._origin_ok():
+            self._send(403, b"forbidden", "text/plain")
+            return
+        got = (self.headers.get("X-YuiLock-Session") or "").encode("utf-8")
+        if not hmac.compare_digest(got, SESSION.encode("utf-8")):
+            self._send(403, b"forbidden", "text/plain")
+            return
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
+            if length < 0 or length > MAX_BODY:
+                self._send(413, b"payload too large", "text/plain")
+                return
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
             name = str(body.get("action", ""))
             result = run_action(name)
