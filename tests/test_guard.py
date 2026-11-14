@@ -38,7 +38,8 @@ class TestCooldown(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.clock = FakeClock()
-        self.g = guard_mod.LockGuard(os.path.join(self.tmp.name, "g.json"), clock=self.clock)
+        self.g = guard_mod.LockGuard(os.path.join(self.tmp.name, "g.json"),
+                                     clock=self.clock, mono_clock=self.clock)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -70,7 +71,8 @@ class TestDailyLimit(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.clock = FakeClock()
-        self.g = guard_mod.LockGuard(os.path.join(self.tmp.name, "g.json"), clock=self.clock)
+        self.g = guard_mod.LockGuard(os.path.join(self.tmp.name, "g.json"),
+                                     clock=self.clock, mono_clock=self.clock)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -114,6 +116,12 @@ class TestExpiry(unittest.TestCase):
 
     def test_pending_none_when_absent(self):
         self.assertIsNone(self.g.pending_expiry())
+
+    def test_no_tmp_leftovers(self):
+        self.g.record("phone")
+        self.g.note_expiry("phone", 1.0)
+        leftovers = list(__import__("pathlib").Path(self.tmp.name).glob("*.tmp"))
+        self.assertEqual(leftovers, [], "原子写不能留下临时文件")
 
     def test_corrupt_state_does_not_raise(self):
         path = os.path.join(self.tmp.name, "g.json")

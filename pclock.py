@@ -24,33 +24,46 @@ LOCK_PATH = Path(tempfile.gettempdir()) / "yuilock_pc_lock.lock"
 class _FileLock:
     """文件锁：包住「检查是否已锁 → 启动 → 写状态」全程，防并发双开。
 
-    Windows 用 msvcrt，其它平台用 fcntl。CI（Linux）会 import 本模块，
-    所以不能无条件 import msvcrt。"""
+    Windows 用 msvcrt，其它平台用 fcntl（CI 在 Linux 上 import 本模块）。
+    拿不到锁不再静默继续：重试到超时后抛 TimeoutError，让调用方明确报错。"""
     _IS_WIN = sys.platform == "win32"
+    TIMEOUT_SEC = 5.0
 
     def __enter__(self):
         self._fp = open(LOCK_PATH, "a+b")
-        try:
-            if self._IS_WIN:
-                import msvcrt
-                msvcrt.locking(self._fp.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
-        except (OSError, ImportError):
-            pass  # 拿不到锁也继续（尽力互斥）
-        return self
+        self._locked = False
+        deadline = time.monotonic() + self.TIMEOUT_SEC
+        while True:
+            try:
+                self._fp.seek(0)
+                if self._IS_WIN:
+                    import msvcrt
+                    msvcrt.locking(self._fp.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._locked = True
+                return self
+            except ImportError as exc:
+                self._fp.close()
+                raise TimeoutError("当前平台没有可用的文件锁实现") from exc
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    self._fp.close()
+                    raise TimeoutError("另一个锁机操作正在进行，请稍后重试") from exc
+                time.sleep(0.05)
 
     def __exit__(self, *exc):
         try:
-            self._fp.seek(0)
-            if self._IS_WIN:
-                import msvcrt
-                msvcrt.locking(self._fp.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
-        except (OSError, ImportError):
+            if self._locked:
+                self._fp.seek(0)
+                if self._IS_WIN:
+                    import msvcrt
+                    msvcrt.locking(self._fp.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
+        except Exception:
             pass
         self._fp.close()
         return False
@@ -238,66 +251,81 @@ def spawn_locker(script: Path, allow_exes: list[str] | None = None,
     """启动锁机进程。ttl_sec>0 时锁机进程到点自行退出（插件崩溃也能解除）。"""
     if sys.platform != "win32":
         return {"ok": False, "error": "锁定电脑仅支持 Windows"}
-    with _FileLock():
-        if is_locker_alive():
-            return {"ok": False, "error": "已有锁机进程在运行，不要重复锁定"}
-        instance = uuid.uuid4().hex
-        python = Path(sys.executable)
-        pythonw = python.with_name("pythonw.exe")
-        exe = str(pythonw if pythonw.exists() else python)
-        args = [exe, str(script), "--instance", instance, "--state", str(STATE_PATH)]
-        if ttl_sec > 0:
-            args += ["--ttl", str(int(ttl_sec))]
-        for p in (allow_exes or []):
-            args += ["--allow", str(p)]
-        try:
-            proc = subprocess.Popen(args, creationflags=CREATE_NO_WINDOW,
-                                    cwd=str(script.parent))
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-        STATE_PATH.write_text(json.dumps(
-            {"pid": proc.pid, "instance": instance, "exe": exe.lower()}),
-            encoding="utf-8")
-        return {"ok": True, "pid": proc.pid, "instance": instance}
+    try:
+        with _FileLock():
+            if is_locker_alive():
+                return {"ok": False, "error": "已有锁机进程在运行，不要重复锁定"}
+            instance = uuid.uuid4().hex
+            python = Path(sys.executable)
+            pythonw = python.with_name("pythonw.exe")
+            exe = str(pythonw if pythonw.exists() else python)
+            args = [exe, str(script), "--instance", instance, "--state", str(STATE_PATH)]
+            if ttl_sec > 0:
+                args += ["--ttl", str(int(ttl_sec))]
+            for p in (allow_exes or []):
+                args += ["--allow", str(p)]
+            try:
+                proc = subprocess.Popen(args, creationflags=CREATE_NO_WINDOW,
+                                        cwd=str(script.parent))
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+            STATE_PATH.write_text(json.dumps(
+                {"pid": proc.pid, "instance": instance, "exe": exe.lower()}),
+                encoding="utf-8")
+            return {"ok": True, "pid": proc.pid, "instance": instance}
+    except TimeoutError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
-def kill_locker() -> tuple[bool, str]:
-    """结束锁机进程。返回 (是否确实结束过, 给用户看的消息)。
+# 解锁结果状态（调用方不要再靠中文消息前缀判断成败）
+UNLOCK_KILLED = "killed"          # 确认结束了锁机进程
+UNLOCK_NOT_LOCKED = "not_locked"  # 本来就没锁
+UNLOCK_GONE = "gone"              # 进程已不在（崩溃/重启），残留状态已清理
+UNLOCK_FAILED = "failed"          # 失败，状态已保留
+
+UNLOCK_OK_STATES = frozenset({UNLOCK_KILLED, UNLOCK_NOT_LOCKED, UNLOCK_GONE})
+
+
+def kill_locker() -> tuple[str, str]:
+    """结束锁机进程。返回 (状态码, 给用户看的消息)，状态码见上方常量。
 
     关键：只有「确认不是本实例」才清状态；「无法确认」必须保留状态并报错。
     否则一次 PowerShell/权限抖动就会把状态删掉，而锁还在跑——从此插件再也找不到它。"""
-    with _FileLock():
-        st = _read_state()
-        if not st:
-            return False, "电脑当前没有锁定"
-        verdict = _state_verdict(st)
-        if verdict is None:
-            return False, ("无法确认锁机进程身份（读取进程信息失败），状态已保留、未结束任何进程；"
-                           "请重试，或用任务管理器结束 pythonw.exe")
-        if verdict is False:
+    try:
+        with _FileLock():
+            st = _read_state()
+            if not st:
+                return UNLOCK_NOT_LOCKED, "电脑当前没有锁定"
+            verdict = _state_verdict(st)
+            if verdict is None:
+                return UNLOCK_FAILED, ("无法确认锁机进程身份（读取进程信息失败），状态已保留、未结束任何进程；"
+                                       "请重试，或用任务管理器结束 pythonw.exe")
+            if verdict is False:
+                try:
+                    STATE_PATH.unlink()
+                except Exception:
+                    pass
+                return UNLOCK_GONE, "锁机进程已不存在（可能崩溃或重启过），残留状态已清理"
+            pid = int(st["pid"])
+            if sys.platform == "win32":
+                try:
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                   capture_output=True, timeout=15,
+                                   creationflags=CREATE_NO_WINDOW)
+                except Exception as exc:
+                    return UNLOCK_FAILED, f"调用 taskkill 失败（{exc}），状态已保留"
+            # 不能凭 taskkill 的返回码下结论：以「进程是否真的消失」为准（最多等 1 秒）
+            for _ in range(20):
+                if not _pid_alive(pid):
+                    break
+                time.sleep(0.05)
+            if _pid_alive(pid):
+                return UNLOCK_FAILED, ("结束锁机进程失败（可能权限不足），状态已保留；"
+                                       "请用任务管理器结束 pythonw.exe")
             try:
                 STATE_PATH.unlink()
             except Exception:
                 pass
-            return False, "锁机进程已不存在（可能崩溃或重启过），残留状态已清理"
-        pid = int(st["pid"])
-        if sys.platform == "win32":
-            try:
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                               capture_output=True, timeout=15,
-                               creationflags=CREATE_NO_WINDOW)
-            except Exception as exc:
-                return False, f"调用 taskkill 失败（{exc}），状态已保留"
-        # 不能凭 taskkill 的返回码下结论：以「进程是否真的消失」为准（最多等 1 秒）
-        for _ in range(20):
-            if not _pid_alive(pid):
-                break
-            time.sleep(0.05)
-        if _pid_alive(pid):
-            return False, ("结束锁机进程失败（可能权限不足），状态已保留；"
-                           "请用任务管理器结束 pythonw.exe")
-        try:
-            STATE_PATH.unlink()
-        except Exception:
-            pass
-        return True, "电脑已解锁，恢复自由"
+            return UNLOCK_KILLED, "电脑已解锁，恢复自由"
+    except TimeoutError as exc:
+        return UNLOCK_FAILED, str(exc)

@@ -43,8 +43,8 @@ class TestKillLockerVerdicts(unittest.TestCase):
         self.p._win_process_cmdline_ctypes = lambda pid: ""
         self.p._win_process_cmdline = lambda pid: ""       # 兜底也读不到
         self.p.subprocess = type("S", (), {"run": staticmethod(lambda *a, **k: self.calls.append(a))})
-        alive, msg = self.p.kill_locker()
-        self.assertFalse(alive)
+        status, msg = self.p.kill_locker()
+        self.assertEqual(status, self.p.UNLOCK_FAILED)
         self.assertIn("无法确认", msg)
         self.assertIn("保留", msg)
         self.assertTrue(self.p.STATE_PATH.exists(), "无法确认时不能删状态文件")
@@ -52,16 +52,16 @@ class TestKillLockerVerdicts(unittest.TestCase):
 
     def test_dead_pid_cleans_state(self):
         self.p._pid_alive = lambda pid: False
-        alive, msg = self.p.kill_locker()
-        self.assertFalse(alive)
+        status, msg = self.p.kill_locker()
+        self.assertEqual(status, self.p.UNLOCK_GONE)
         self.assertIn("已不存在", msg)
         self.assertFalse(self.p.STATE_PATH.exists())
 
     def test_reused_pid_cleans_state(self):
         self.p._pid_alive = lambda pid: True
         self.p._win_process_path = lambda pid: r"c:\other\chrome.exe"
-        alive, msg = self.p.kill_locker()
-        self.assertFalse(alive)
+        status, msg = self.p.kill_locker()
+        self.assertEqual(status, self.p.UNLOCK_GONE)
         self.assertFalse(self.p.STATE_PATH.exists())
 
     def test_confirmed_instance_kills(self):
@@ -87,8 +87,8 @@ class TestKillLockerVerdicts(unittest.TestCase):
 
         self.p.subprocess = FakeSub
         self.p.sys = FakeSys  # 强制走 taskkill 分支（CI 是 Linux）
-        alive, msg = self.p.kill_locker()
-        self.assertTrue(alive)
+        status, msg = self.p.kill_locker()
+        self.assertEqual(status, self.p.UNLOCK_KILLED)
         self.assertIn("已解锁", msg)
         # taskkill 只在 Windows 执行；CI（Linux）上验证状态清理与返回值即可
         if sys.platform == "win32":
@@ -96,7 +96,7 @@ class TestKillLockerVerdicts(unittest.TestCase):
         self.assertFalse(self.p.STATE_PATH.exists())
 
     def test_taskkill_failure_keeps_state(self):
-        """taskkill 返回 0 但进程还在（权限不足）→ 必须报失败并保留状态。"""
+        """taskkill 之后进程仍在（无论返回码是多少）→ 必须报失败并保留状态。"""
         self.p._pid_alive = lambda pid: True
         self.p._win_process_path = lambda pid: self.state["exe"]
         self.p._win_process_cmdline_ctypes = lambda pid: (
@@ -115,8 +115,8 @@ class TestKillLockerVerdicts(unittest.TestCase):
 
         self.p.subprocess = FakeSub
         self.p.sys = FakeSys  # 强制走 taskkill 分支（CI 是 Linux）
-        alive, msg = self.p.kill_locker()
-        self.assertFalse(alive)
+        status, msg = self.p.kill_locker()
+        self.assertEqual(status, self.p.UNLOCK_FAILED)
         self.assertIn("失败", msg)
         self.assertTrue(self.p.STATE_PATH.exists(), "杀不掉时不能删状态")
 

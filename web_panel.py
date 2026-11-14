@@ -97,10 +97,9 @@ def run_action(name: str) -> dict:
             return {"ok": True, "message": "电脑已锁定：打开任何程序都会被立即弹回桌面"}
         return {"ok": False, "message": f"锁定失败：{r.get('error')}"}
     if name == "unlock_pc":
-        alive, msg = pclock.kill_locker()
-        # 如实返回：只有「确实解锁」或「本来就没锁」算成功，失败要让面板显示出来
-        idempotent = msg.startswith(("电脑当前没有锁定", "锁机进程已不存在"))
-        return {"ok": bool(alive or idempotent), "message": msg}
+        status, msg = pclock.kill_locker()
+        # 如实返回：只有「确实解锁 / 本来没锁 / 进程已不在」算成功
+        return {"ok": status in pclock.UNLOCK_OK_STATES, "message": msg}
     return {"ok": False, "message": f"未知操作 {name}"}
 
 

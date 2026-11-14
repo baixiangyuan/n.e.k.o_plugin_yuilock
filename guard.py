@@ -8,22 +8,33 @@
 3. 到期记录：锁手机应用锁时记下自动解除时间，插件重载后仍能续上，
    不会因为一次 reload 就把「到点解锁」弄丢。
 
-文件落在 %TEMP%，插件重载不清零；测试可注入 clock 与 path。
+可靠性取舍：
+- 写状态用「临时文件 + os.replace」，不会出现半截 JSON；
+- 同一进程内用 threading.Lock 串行化；跨进程（插件 + Web 面板）仍是
+  best-effort —— check 与 record 之间有一个很短的窗口，属于软性风控可接受范围；
+- 冷却优先用 monotonic（同进程内改系统时间也绕不过），跨进程重启后回落到墙上时钟。
 """
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 STATE_PATH = Path(tempfile.gettempdir()) / "yuilock_guard.json"
+_STATE_LOCK = threading.Lock()
 
 
 class LockGuard:
-    def __init__(self, path: Path | str | None = None, clock=time.time):
+    def __init__(self, path: Path | str | None = None, clock=time.time,
+                 mono_clock=time.monotonic):
         self.path = Path(path) if path else STATE_PATH
         self._clock = clock
+        self._mono = mono_clock
+        # 本次进程内每个目标的最后锁定时刻（monotonic），用于抵抗改系统时间
+        self._last_mono: dict[str, float] = {}
 
     # ---------------- 状态存取 ----------------
 
@@ -35,10 +46,18 @@ class LockGuard:
             return {}
 
     def _save(self, data: dict) -> None:
+        tmp = None
         try:
-            self.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.path)   # 原子替换：不会留下半截文件
         except Exception:
-            pass
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
 
     def _today(self, now: float) -> str:
         return time.strftime("%Y-%m-%d", time.localtime(now))
@@ -48,44 +67,60 @@ class LockGuard:
     def check(self, kind: str, cooldown_sec: int, daily_limit: int) -> str | None:
         """返回 None 表示允许；返回字符串表示拒绝原因（直接给 LLM 看）。"""
         now = self._clock()
-        data = self._load()
-        if data.get("date") == self._today(now):
-            count = int(data.get("count", 0) or 0)
-            if daily_limit > 0 and count >= daily_limit:
-                return (f"今天已经锁过 {count} 次了（上限 {daily_limit} 次），"
-                        f"先冷静一下，不能再锁了。")
+        mono = self._mono()
+        with _STATE_LOCK:
+            data = self._load()
+        if data.get("date") != self._today(now):
+            return None
+        count = int(data.get("count", 0) or 0)
+        if daily_limit > 0 and count >= daily_limit:
+            return (f"今天已经锁过 {count} 次了（上限 {daily_limit} 次），"
+                    f"先冷静一下，不能再锁了。")
+        if cooldown_sec <= 0:
+            return None
+        # 优先用本进程的 monotonic：即使把系统时间往前调也绕不过冷却
+        if kind in self._last_mono:
+            elapsed = max(0.0, mono - self._last_mono[kind])
+        else:
             last = float((data.get("last_ts") or {}).get(kind, 0) or 0)
-            if cooldown_sec > 0 and last > 0:
-                left = cooldown_sec - (now - last)
-                if left > 0:
-                    return (f"刚刚才锁过{'手机' if kind == 'phone' else '电脑'}，"
-                            f"冷却中（还剩 {int(left) + 1} 秒），不能连续锁。")
+            if last <= 0:
+                return None
+            elapsed = max(0.0, now - last)
+        left = cooldown_sec - elapsed
+        if left > 0:
+            return (f"刚刚才锁过{'手机' if kind == 'phone' else '电脑'}，"
+                    f"冷却中（还剩 {int(left) + 1} 秒），不能连续锁。")
         return None
 
     def record(self, kind: str) -> None:
         now = self._clock()
-        data = self._load()
-        today = self._today(now)
-        if data.get("date") != today:
-            data = {"date": today, "count": 0}
-        data["count"] = int(data.get("count", 0) or 0) + 1
-        last = data.get("last_ts")
-        if not isinstance(last, dict):
-            last = {}
-        last[kind] = now
-        data["last_ts"] = last
-        self._save(data)
+        mono = self._mono()
+        with _STATE_LOCK:
+            data = self._load()
+            today = self._today(now)
+            if data.get("date") != today:
+                data = {"date": today, "count": 0}
+            data["count"] = int(data.get("count", 0) or 0) + 1
+            last = data.get("last_ts")
+            if not isinstance(last, dict):
+                last = {}
+            last[kind] = now
+            data["last_ts"] = last
+            self._save(data)
+            self._last_mono[kind] = mono
 
     # ---------------- 到期记录 ----------------
 
     def note_expiry(self, kind: str, expires_at: float) -> None:
-        data = self._load()
-        data["expire_kind"] = kind
-        data["expires_at"] = float(expires_at)
-        self._save(data)
+        with _STATE_LOCK:
+            data = self._load()
+            data["expire_kind"] = kind
+            data["expires_at"] = float(expires_at)
+            self._save(data)
 
     def pending_expiry(self) -> tuple[str, float] | None:
-        data = self._load()
+        with _STATE_LOCK:
+            data = self._load()
         kind = str(data.get("expire_kind") or "")
         try:
             ts = float(data.get("expires_at", 0) or 0)
@@ -96,14 +131,16 @@ class LockGuard:
         return kind, ts
 
     def clear_expiry(self) -> None:
-        data = self._load()
-        if "expire_kind" in data or "expires_at" in data:
-            data.pop("expire_kind", None)
-            data.pop("expires_at", None)
-            self._save(data)
+        with _STATE_LOCK:
+            data = self._load()
+            if "expire_kind" in data or "expires_at" in data:
+                data.pop("expire_kind", None)
+                data.pop("expires_at", None)
+                self._save(data)
 
     def stats(self) -> dict:
-        data = self._load()
+        with _STATE_LOCK:
+            data = self._load()
         return {
             "date": data.get("date"),
             "count": int(data.get("count", 0) or 0),

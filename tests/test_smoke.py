@@ -354,8 +354,8 @@ class TestPclockState(unittest.TestCase):
         pclock.STATE_PATH.write_text(
             json.dumps({"pid": "abc", "instance": "x", "exe": "y"}), encoding="utf-8")
         self.assertFalse(pclock.is_locker_alive())
-        alive, _msg = pclock.kill_locker()
-        self.assertFalse(alive)
+        status, _msg = pclock.kill_locker()
+        self.assertEqual(status, pclock.UNLOCK_GONE)
         self.assertFalse(pclock.STATE_PATH.exists())
 
         # 2) 并发 spawn：两线程同时锁定，只能留下一个锁进程

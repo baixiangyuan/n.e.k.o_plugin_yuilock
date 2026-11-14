@@ -86,15 +86,15 @@ class TestUnlockPcReportsTruth(unittest.TestCase):
             panel.pclock.kill_locker = orig
 
     def test_success(self):
-        r = self._run_with((True, "电脑已解锁，恢复自由"))
+        r = self._run_with((panel.pclock.UNLOCK_KILLED, "电脑已解锁，恢复自由"))
         self.assertTrue(r["ok"])
 
     def test_not_locked_is_ok(self):
-        r = self._run_with((False, "电脑当前没有锁定"))
+        r = self._run_with((panel.pclock.UNLOCK_NOT_LOCKED, "电脑当前没有锁定"))
         self.assertTrue(r["ok"])
 
     def test_failure_is_not_ok(self):
-        r = self._run_with((False, "结束锁机进程失败（可能权限不足），状态已保留"))
+        r = self._run_with((panel.pclock.UNLOCK_FAILED, "结束锁机进程失败（可能权限不足），状态已保留"))
         self.assertFalse(r["ok"], "杀不掉时面板不能报成功")
         self.assertIn("失败", r["message"])
 
