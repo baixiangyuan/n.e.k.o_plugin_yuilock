@@ -82,7 +82,11 @@ class TestKillLockerVerdicts(unittest.TestCase):
                 alive_flag["v"] = False  # taskkill 生效
                 return FakeProc()
 
+        class FakeSys:
+            platform = "win32"
+
         self.p.subprocess = FakeSub
+        self.p.sys = FakeSys  # 强制走 taskkill 分支（CI 是 Linux）
         alive, msg = self.p.kill_locker()
         self.assertTrue(alive)
         self.assertIn("已解锁", msg)
@@ -106,7 +110,11 @@ class TestKillLockerVerdicts(unittest.TestCase):
             def run(args, **kwargs):
                 return FakeProc()
 
+        class FakeSys:
+            platform = "win32"
+
         self.p.subprocess = FakeSub
+        self.p.sys = FakeSys  # 强制走 taskkill 分支（CI 是 Linux）
         alive, msg = self.p.kill_locker()
         self.assertFalse(alive)
         self.assertIn("失败", msg)
