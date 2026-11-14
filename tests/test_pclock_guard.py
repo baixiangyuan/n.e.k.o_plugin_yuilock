@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 
@@ -79,7 +80,9 @@ class TestKillLockerVerdicts(unittest.TestCase):
         alive, msg = self.p.kill_locker()
         self.assertTrue(alive)
         self.assertIn("已解锁", msg)
-        self.assertEqual(len(killed), 1)
+        # taskkill 只在 Windows 执行；CI（Linux）上验证状态清理与返回值即可
+        if sys.platform == "win32":
+            self.assertEqual(len(killed), 1)
         self.assertFalse(self.p.STATE_PATH.exists())
 
     def test_instance_mismatch_is_not_confirmed(self):
